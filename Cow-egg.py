@@ -5,7 +5,7 @@ import io
 
 # ページの設定
 st.set_page_config(page_title="胚検出・評価AIアプリ", layout="centered")
-st.title("🔬 胚検出・評価AIシステム")
+st.title(" 胚検出・評価AIシステム")
 st.write("画像をアップロードすると、AIが自動で解析して評価・検出を行います。")
 
 # --- Roboflowの設定 ---
@@ -53,7 +53,7 @@ if uploaded_file is not None:
                 if not predictions:
                     st.info("対象のオブジェクトは検出されませんでした。")
                 else:
-                    st.subheader("📊 検出結果（評価データ）")
+                    st.subheader(" 検出結果（評価データ）")
                     st.write(f"検出数: {len(predictions)} 個")
                     
                     # データを綺麗に表示（JSON、またはカスタマイズして表形式など）
