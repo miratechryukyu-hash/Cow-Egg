@@ -1,4 +1,3 @@
 streamlit
-inference-sdk
-Pillow
-opencv-python-headless
+pillow
+requests
