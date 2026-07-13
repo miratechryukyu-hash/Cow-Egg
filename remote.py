@@ -32,7 +32,7 @@ with tab1:
         # スマホからアクセスするとカメラが起動します
         uploaded_file = st.file_uploader("患部の写真を撮影・アップロード", type=["jpg", "jpeg", "png"])
         
-        submit_button = st.form_submit_with_button("報告を送信する")
+        submit_button = st.form_submit_button("報告を送信する")
         
         if submit_button:
             if not reporter or not animal_id:
