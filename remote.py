@@ -1,16 +1,15 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-import os
+from streamlit_gsheets import GSheetsConnection
 
 st.set_page_config(page_title="動物遠隔診療MVP", layout="wide")
 st.title("動物遠隔診療サポートシステム")
 
-# プロトタイプ用の簡易データ保存
-if "records" not in st.session_state:
-    st.session_state.records = []
+# Googleスプレッドシートへの接続設定
+conn = st.connection("gsheets", type=GSheetsConnection)
 
-# タブの作成（現場用と獣医用）
+# タブの作成
 tab1, tab2 = st.tabs(["現場からの報告フォーム", "獣医師用ダッシュボード"])
 
 # -------------------------------------------------------------------------
@@ -29,42 +28,45 @@ with tab1:
             ["食欲不振", "歩行異常", "出血", "下痢・嘔吐", "ぐったりしている", "その他"]
         )
         
-        # スマホからアクセスするとカメラが起動します
-        uploaded_file = st.file_uploader("患部の写真を撮影・アップロード", type=["jpg", "jpeg", "png"])
-        
+        # 簡易運用のための写真なし版（まずは文字データ連携を確実に動かします）
         submit_button = st.form_submit_button("報告を送信する")
         
         if submit_button:
             if not reporter or not animal_id:
                 st.error("報告者名と個体識別番号は必須です。")
             else:
-                # ルールベースのトリアージ判定
+                # トリアージ判定
                 triage = "低・定例報告"
                 if temperature >= 40.0 or "出血" in symptoms or "ぐったりしている" in symptoms:
                     triage = "高・即時相談"
                 elif temperature >= 39.3 or len(symptoms) > 0:
                     triage = "中・要観察"
                 
-                # レコードの作成
-                new_record = {
-                    "id": len(st.session_state.records) + 1,
-                    "datetime": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "reporter": reporter,
-                    "animal_id": animal_id,
-                    "temperature": temperature,
-                    "symptoms": ", ".join(symptoms),
-                    "triage": triage,
-                    "status": "未確認",
-                    "comment": "",
-                    "image": uploaded_file.read() if uploaded_file else None
-                }
+                # 新しいレコードのデータ
+                new_data = pd.DataFrame([{
+                    "記録ID": str(int(datetime.now().timestamp())),
+                    "日時": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "報告者名": reporter,
+                    "個体識別番号": animal_id,
+                    "体温": temperature,
+                    "主な症状": ", ".join(symptoms),
+                    "患部写真": "写真なし",
+                    "トリアージ判定": triage,
+                    "確認ステータス": "未確認",
+                    "獣医師コメント": ""
+                }])
                 
-                st.session_state.records.append(new_record)
-                
-                # 画面表示
-                st.success(f"送信完了しました。 判定結果: {triage}")
-                if "高" in triage:
-                    st.warning("警告: 緊急度が高いです。必要に応じて直接電話連絡も行ってください。")
+                try:
+                    # 既存のデータを取得して結合（ここで問診記録のシートを探します）
+                    existing_data = conn.read(worksheet="問診記録", ttl=0)
+                    updated_data = pd.concat([existing_data, new_data], ignore_index=True)
+                    
+                    # スプレッドシートを更新
+                    conn.update(worksheet="問診記録", data=updated_data)
+                    st.success(f"スプレッドシートへの送信が完了しました。 判定結果: {triage}")
+                    
+                except Exception as e:
+                    st.error(f"送信エラーが発生しました: {e}")
 
 # -------------------------------------------------------------------------
 # タブ2: 獣医師用ダッシュボード
@@ -72,33 +74,32 @@ with tab1:
 with tab2:
     st.header("未対応の報告一覧")
     
-    if not st.session_state.records:
-        st.info("現在、未対応の報告はありません。")
-    else:
-        # 未確認のものを取り出して表示
-        df = pd.DataFrame(st.session_state.records)
+    try:
+        # スプレッドシートから最新データを読み込み
+        df = conn.read(worksheet="問診記録", ttl=0)
         
-        for idx, row in df.iterrows():
-            with st.container():
-                st.markdown(f"### 【{row['triage']}】 個体: {row['animal_id']} (ステータス: {row['status']})")
-                col1, col2 = st.columns([2, 1])
-                
-                with col1:
-                    st.write(f"**報告日時:** {row['datetime']} | **報告者:** {row['reporter']}")
-                    st.write(f"**体温:** {row['temperature']} C")
-                    st.write(f"**症状:** {row['symptoms']}")
+        # 未確認のデータのみ抽出
+        unconfirmed_df = df[df["確認ステータス"] == "未確認"]
+        
+        if unconfirmed_df.empty:
+            st.info("現在、未対応の報告はありません。")
+        else:
+            for idx, row in unconfirmed_df.iterrows():
+                with st.container():
+                    st.markdown(f"### 【{row['トリアージ判定']}】 個体: {row['個体識別番号']}")
+                    st.write(f"**報告日時:** {row['日時']} | **報告者:** {row['報告者名']}")
+                    st.write(f"**体温:** {row['体温']} C")
+                    st.write(f"**症状:** {row['主な症状']}")
                     
-                    # 獣医師のコメント入力
-                    comment = st.text_area(f"指示・コメントを入力 ({row['animal_id']})", key=f"com_{row['id']}")
-                    if st.button(f"対応完了にする ({row['animal_id']})", key=f"btn_{row['id']}"):
-                        st.session_state.records[idx]['status'] = "対応完了"
-                        st.session_state.records[idx]['comment'] = comment
+                    # コメント入力と更新
+                    comment = st.text_area(f"指示・コメントを入力 ({row['個体識別番号']})", key=f"com_{idx}")
+                    if st.form_submit_button or st.button(f"対応完了にする ({row['個体識別番号']})", key=f"btn_{idx}"):
+                        # 該当行のステータスとコメントを更新
+                        df.at[idx, "確認ステータス"] = "対応完了"
+                        df.at[idx, "獣医師コメント"] = comment
+                        conn.update(worksheet="問診記録", data=df)
                         st.success("ステータスを更新しました。")
                         st.rerun()
-                
-                with col2:
-                    if row['image']:
-                        st.image(row['image'], caption="現場からの写真", use_container_width=True)
-                    else:
-                        st.text("写真なし")
-                st.markdown("---")
+                    st.markdown("---")
+    except Exception as e:
+        st.error(f"データ読み込みエラー: {e}")
