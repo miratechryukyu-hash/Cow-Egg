@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from streamlit_gsheets import GSheetsConnection
 import io
 from google.oauth2.service_account import Credentials
@@ -84,7 +84,12 @@ with tab1:
                         except Exception as e:
                             st.error(f"写真のアップロードに失敗しました: {e}")
                             photo_id = "アップロード失敗"
-                    
+
+                    # --- データ送信処理の箇所 ---
+                    # 記録ID生成
+                    record_id = str(int(datetime.now(timezone(timedelta(hours=+9))).timestamp()))
+                    # 日時生成
+                    now_jst = datetime.now(timezone(timedelta(hours=+9))).strftime("%Y-%m-%d %H:%M")
                     new_data = pd.DataFrame([{
                         "記録ID": str(int(datetime.now().timestamp())),
                         "日時": datetime.now().strftime("%Y-%m-%d %H:%M"),
