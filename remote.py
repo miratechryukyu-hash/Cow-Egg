@@ -6,8 +6,15 @@ import io
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+import streamlit as st
+import os
+
+# カレンダーのUIを強制的に日本語（日本地域）にする設定
+os.environ["LC_ALL"] = "ja_JP.UTF-8"
+os.environ["LANG"] = "ja_JP.UTF-8"
 
 st.set_page_config(page_title="動物遠隔診療MVP", layout="wide")
+
 st.title("動物遠隔診療サポートシステム")
 
 # Googleスプレッドシートへの接続設定
