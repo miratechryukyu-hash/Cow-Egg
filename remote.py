@@ -54,10 +54,11 @@ with tab1:
     with st.form("report_form", clear_on_submit=False):
         # 【変更】報告者名を削除し、牛の生年月日（カレンダー選択）を追加
         animal_id = st.text_input("個体識別番号 / 名前")
-        birth_date = st.date_input("牛の生年月日", 
-                                   value=datetime.now() - timedelta(days=365),
-                                   format="YYYY/MM/DD"
-                                  )
+        birth_date = st.date_input(
+            "牛の生年月日", 
+            value=datetime.now() - timedelta(days=365),
+            format="YYYY/MM/DD"
+        )
         temperature = st.number_input("測定体温 (C)", min_value=30.0, max_value=45.0, value=38.5, step=0.1)
         
         symptoms = st.multiselect(
