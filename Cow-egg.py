@@ -168,11 +168,24 @@ if uploaded_file is not None:
                 st.success("解析が完了しました！")
 
                 if not predictions:
-                    st.info("対象のオブジェクトは検出されませんでした。")
+                    st.info("対象の胚は検出されませんでした。")
                 else:
-                    st.subheader("検出結果（評価データ）")
-                    st.write(f"検出数: {len(predictions)} 個")
-                    st.json(result)
+                    st.subheader("AI診断結果")
+                    
+                    # 検出された予測を一つずつわかりやすく表示する
+                    for i, pred in enumerate(predictions):
+                        # AIが判定したクラス名（例: EB-Aなど）を取得
+                        grade = pred.get("class", "判定不能")
+                        # AIの自信度（確信度）をパーセンテージに変換
+                        confidence = pred.get("confidence", 0) * 100
+                        
+                        # 現場の人が一目でわかるようにデカデカと表示！
+                        st.success(f"診断: この胚は **【 {grade} 】** です！（AI確信度: {confidence:.1f}%）")
+                    
+                    # 画面がごちゃごちゃしないよう、元の生のデータは折りたたみメニューに隠す
+                    with st.expander("詳細な解析データを見る（開発者・データ確認用）"):
+                        st.write(f"検出数: {len(predictions)} 個")
+                        st.json(result)
 
             except requests.HTTPError as e:
                 status = e.response.status_code if e.response is not None else None
