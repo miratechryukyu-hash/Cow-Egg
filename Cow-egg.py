@@ -114,7 +114,7 @@ def run_inference(
     for url in build_inference_urls(model_id, workspace):
         response = requests.post(
             url,
-            params={"api_key": api_key},
+            params={"api_key": api_key, "confidence": 10}, 
             files={"file": ("image.jpg", img_bytes, "image/jpeg")},
             timeout=120,
         )
