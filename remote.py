@@ -3,9 +3,6 @@ import pandas as pd
 from datetime import datetime, timezone, timedelta
 from streamlit_gsheets import GSheetsConnection
 import io
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 import requests
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -24,17 +21,13 @@ st.title("動物遠隔診療サポートシステム")
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 NOTIFICATION_SETTINGS_KEYS = [
-    "メールアドレス",
-    "メール通知",
-    "Telegram_Chat_ID",
-    "Telegram通知",
+    "LINE_User_ID",
+    "LINE通知",
 ]
 
 DEFAULT_NOTIFICATION_SETTINGS = {
-    "メールアドレス": "",
-    "メール通知": "無効",
-    "Telegram_Chat_ID": "",
-    "Telegram通知": "無効",
+    "LINE_User_ID": "",
+    "LINE通知": "無効",
 }
 
 # -------------------------------------------------------------------------
@@ -60,77 +53,110 @@ def save_notification_settings(settings):
     conn.update(worksheet="通知設定", data=df)
 
 
-def format_report_message(report):
-    return (
+def get_app_url():
+    line_config = st.secrets.get("line", {})
+    app_config = st.secrets.get("app", {})
+    return (line_config.get("app_url") or app_config.get("url") or "").rstrip("/")
+
+
+def build_dashboard_url(record_id):
+    app_url = get_app_url()
+    if not app_url:
+        return ""
+    return f"{app_url}?view=dashboard&record_id={record_id}"
+
+
+def format_report_message(report, dashboard_url=""):
+    message = (
         "【動物遠隔診療】新しい現場報告があります\n\n"
         f"判定: {report['トリアージ判定']}\n"
         f"個体: {report['個体識別番号']}\n"
         f"生年月日: {report['報告者名']}\n"
         f"体温: {report['体温']} ℃\n"
         f"症状: {report['主な症状'] or 'なし'}\n"
-        f"報告日時: {report['日時']}\n\n"
-        "獣医師用ダッシュボードで内容を確認してください。"
+        f"報告日時: {report['日時']}"
+    )
+    if dashboard_url:
+        message += f"\n\n▼ 状況確認\n{dashboard_url}"
+    return message
+
+
+def build_line_messages(report):
+    dashboard_url = build_dashboard_url(report["記録ID"])
+    summary = (
+        f"【{report['トリアージ判定']}】\n"
+        f"個体: {report['個体識別番号']}\n"
+        f"体温: {report['体温']}℃\n"
+        f"症状: {report['主な症状'] or 'なし'}\n"
+        f"日時: {report['日時']}"
     )
 
+    if dashboard_url:
+        return [
+            {
+                "type": "template",
+                "altText": f"新しい現場報告: {report['個体識別番号']}",
+                "template": {
+                    "type": "buttons",
+                    "text": summary[:160],
+                    "actions": [
+                        {
+                            "type": "uri",
+                            "label": "状況を確認",
+                            "uri": dashboard_url,
+                        }
+                    ],
+                },
+            }
+        ]
 
-def send_email_notification(to_email, subject, body):
-    smtp_config = st.secrets.get("smtp")
-    if not smtp_config:
-        return False, "SMTP設定（secrets.toml の [smtp]）がありません。"
-
-    message = MIMEMultipart()
-    message["From"] = smtp_config["from_email"]
-    message["To"] = to_email
-    message["Subject"] = subject
-    message.attach(MIMEText(body, "plain", "utf-8"))
-
-    try:
-        with smtplib.SMTP(smtp_config["host"], int(smtp_config["port"])) as server:
-            if smtp_config.get("use_tls", True):
-                server.starttls()
-            if smtp_config.get("username") and smtp_config.get("password"):
-                server.login(smtp_config["username"], smtp_config["password"])
-            server.send_message(message)
-        return True, "メールを送信しました。"
-    except Exception as e:
-        return False, f"メール送信エラー: {e}"
+    return [{"type": "text", "text": format_report_message(report)}]
 
 
-def send_telegram_notification(chat_id, message):
-    telegram_config = st.secrets.get("telegram")
-    if not telegram_config or not telegram_config.get("bot_token"):
-        return False, "Telegram設定（secrets.toml の [telegram] bot_token）がありません。"
+def send_line_notification(user_id, report):
+    line_config = st.secrets.get("line")
+    if not line_config or not line_config.get("channel_access_token"):
+        return False, "LINE設定（secrets.toml の [line] channel_access_token）がありません。"
+
+    if not get_app_url():
+        return False, "アプリURL（secrets.toml の [line] app_url）がありません。"
 
     try:
         response = requests.post(
-            f"https://api.telegram.org/bot{telegram_config['bot_token']}/sendMessage",
-            json={"chat_id": chat_id, "text": message},
+            "https://api.line.me/v2/bot/message/push",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {line_config['channel_access_token']}",
+            },
+            json={
+                "to": user_id,
+                "messages": build_line_messages(report),
+            },
             timeout=10,
         )
         response.raise_for_status()
-        return True, "Telegramに通知を送信しました。"
+        return True, "LINEに通知を送信しました。"
+    except requests.HTTPError as e:
+        detail = e.response.text if e.response is not None else str(e)
+        return False, f"LINE送信エラー: {detail}"
     except Exception as e:
-        return False, f"Telegram送信エラー: {e}"
+        return False, f"LINE送信エラー: {e}"
 
 
 def notify_veterinarian(report):
     settings = load_notification_settings()
-    message = format_report_message(report)
-    subject = f"【{report['トリアージ判定']}】現場報告: {report['個体識別番号']}"
     results = []
 
-    if settings.get("メール通知") == "有効" and settings.get("メールアドレス"):
-        ok, detail = send_email_notification(settings["メールアドレス"], subject, message)
-        results.append(("メール", ok, detail))
-    elif settings.get("メール通知") == "有効":
-        results.append(("メール", False, "メールアドレスが未登録です。"))
+    if settings.get("LINE通知") != "有効":
+        return results
 
-    if settings.get("Telegram通知") == "有効" and settings.get("Telegram_Chat_ID"):
-        ok, detail = send_telegram_notification(settings["Telegram_Chat_ID"], message)
-        results.append(("Telegram", ok, detail))
-    elif settings.get("Telegram通知") == "有効":
-        results.append(("Telegram", False, "Telegram Chat IDが未登録です。"))
+    user_id = settings.get("LINE_User_ID", "").strip()
+    if not user_id:
+        results.append(("LINE", False, "LINE User IDが未登録です。"))
+        return results
 
+    ok, detail = send_line_notification(user_id, report)
+    results.append(("LINE", ok, detail))
     return results
 
 
@@ -201,6 +227,80 @@ def render_media(file_data):
                 st.caption("現場からの動画")
     else:
         st.info("メディア添付なし")
+
+
+def render_report_detail(df, row_idx, row, *, allow_complete=True):
+    st.markdown(f"### 【{row['トリアージ判定']}】 個体: {row['個体識別番号']}")
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        st.write(f"**報告日時:** {row['日時']} | **牛の生年月日:** {row['報告者名']}")
+        st.write(f"**体温:** {row['体温']} ℃")
+        st.write(f"**症状:** {row['主な症状'] or 'なし'}")
+        st.write(f"**確認ステータス:** {row['確認ステータス']}")
+        if row["獣医師コメント"]:
+            st.write(f"**獣医師コメント:** {row['獣医師コメント']}")
+
+        if allow_complete and row["確認ステータス"] == "未確認":
+            comment = st.text_area("指示・コメントを入力", key=f"comment_{row_idx}")
+            if st.button("対応完了にする", key=f"btn_{row_idx}"):
+                df.loc[row_idx, "確認ステータス"] = "対応完了"
+                df.loc[row_idx, "獣医師コメント"] = comment
+                conn.update(worksheet="問診記録", data=df)
+                st.success("ステータスとコメントを更新しました。")
+                st.rerun()
+        elif row["確認ステータス"] == "対応完了":
+            st.info("この報告は対応済みです。")
+
+    with col2:
+        render_media(row["患部写真"])
+
+
+def render_vet_dashboard(focus_record_id=None):
+    df = load_records_df()
+
+    if focus_record_id:
+        matches = df[df["記録ID"].astype(str) == str(focus_record_id)]
+        if matches.empty:
+            st.error("指定された報告が見つかりません。")
+            return
+
+        row_idx = matches.index[0]
+        row = matches.iloc[0]
+        render_report_detail(df, row_idx, row)
+        return
+
+    unconfirmed_df = df[df["確認ステータス"] == "未確認"]
+
+    if unconfirmed_df.empty:
+        st.info("現在、未対応の報告はありません。")
+        return
+
+    indices = unconfirmed_df.index.tolist()
+
+    def format_option(idx):
+        row = unconfirmed_df.loc[idx]
+        return f"{row['日時']} - 個体: {row['個体識別番号']} (生年月日: {row['報告者名']})"
+
+    selected_idx = st.selectbox("対応する報告を選択してください", indices, format_func=format_option)
+
+    if selected_idx is not None:
+        row = unconfirmed_df.loc[selected_idx]
+        with st.container():
+            render_report_detail(df, selected_idx, row)
+
+
+# LINE通知のURLから開いた場合は、該当報告のダッシュボードを直接表示
+if st.query_params.get("view") == "dashboard":
+    st.header("獣医師用ダッシュボード")
+    if st.query_params.get("record_id"):
+        st.info("LINE通知から開きました。該当の報告を表示しています。")
+    try:
+        render_vet_dashboard(focus_record_id=st.query_params.get("record_id"))
+    except Exception as e:
+        st.error(f"データ読み込みエラー: {e}")
+    st.stop()
 
 
 # タブの作成
@@ -304,7 +404,7 @@ with tab1:
                                 else:
                                     st.warning(f"{channel}通知: {detail}")
                         else:
-                            st.caption("獣医師への通知は「通知設定」タブで有効化できます。")
+                            st.caption("獣医師へのLINE通知は「通知設定」タブで有効化できます。")
                     except Exception as e:
                         st.error(f"送信エラーが発生しました: {e}")
 
@@ -313,46 +413,9 @@ with tab1:
 # -------------------------------------------------------------------------
 with tab2:
     st.header("未対応の報告一覧")
-    
+
     try:
-        df = load_records_df()
-        unconfirmed_df = df[df["確認ステータス"] == "未確認"]
-        
-        if unconfirmed_df.empty:
-            st.info("現在、未対応の報告はありません。")
-        else:
-            indices = unconfirmed_df.index.tolist()
-            
-            def format_option(idx):
-                row = unconfirmed_df.loc[idx]
-                return f"{row['日時']} - 個体: {row['個体識別番号']} (生年月日: {row['報告者名']})"
-            
-            selected_idx = st.selectbox("対応する報告を選択してください", indices, format_func=format_option)
-            
-            if selected_idx is not None:
-                row = unconfirmed_df.loc[selected_idx]
-                
-                with st.container():
-                    st.markdown(f"### 【{row['トリアージ判定']}】 個体: {row['個体識別番号']}")
-                    
-                    col1, col2 = st.columns([2, 1])
-                    
-                    with col1:
-                        st.write(f"**報告日時:** {row['日時']} | **牛の生年月日:** {row['報告者名']}")
-                        st.write(f"**体温:** {row['体温']} C")
-                        st.write(f"**症状:** {row['主な症状']}")
-                        
-                        comment = st.text_area("指示・コメントを入力", key=f"comment_{selected_idx}")
-                        if st.button("対応完了にする", key=f"btn_{selected_idx}"):
-                            df.loc[selected_idx, "確認ステータス"] = "対応完了"
-                            df.loc[selected_idx, "獣医師コメント"] = comment
-                            conn.update(worksheet="問診記録", data=df)
-                            st.success("ステータスとコメントを更新しました。")
-                            st.rerun()
-                            
-                    with col2:
-                        render_media(row["患部写真"])
-                            
+        render_vet_dashboard()
     except Exception as e:
         st.error(f"データ読み込みエラー: {e}")
 
@@ -443,50 +506,36 @@ with tab3:
 # タブ4: 通知設定
 # -------------------------------------------------------------------------
 with tab4:
-    st.header("獣医師への通知設定")
-    st.caption("現場から報告が送信されたとき、登録した連絡先へスマホに通知します。")
+    st.header("獣医師へのLINE通知設定")
+    st.caption("現場から報告が送信されたとき、獣医師のLINEへプッシュ通知します。")
 
     current_settings = load_notification_settings()
 
     with st.form("notification_settings_form"):
-        st.subheader("メール通知")
-        st.write("スマホのメールアプリに届きます（Gmailなど通知ONにしてください）。")
-        email_address = st.text_input(
-            "通知先メールアドレス",
-            value=current_settings.get("メールアドレス", ""),
-            placeholder="vet@example.com",
+        st.subheader("LINE通知")
+        st.markdown(
+            "1. [LINE Developers](https://developers.line.biz/) で Messaging API チャネル（公式アカウント）を作成\n"
+            "2. **Channel access token** を管理者が `secrets.toml` に設定\n"
+            "3. 獣医師が公式LINEアカウントを**友だち追加**し、任意のメッセージを送信\n"
+            "4. Webhook ログ等で確認した **User ID** を下に入力"
         )
-        email_enabled = st.checkbox(
-            "メール通知を有効にする",
-            value=current_settings.get("メール通知") == "有効",
+        line_user_id = st.text_input(
+            "LINE User ID",
+            value=current_settings.get("LINE_User_ID", ""),
+            placeholder="Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            help="友だち追加後にメッセージを送ると Webhook ログに表示されます。",
         )
-
-        st.divider()
-        st.subheader("Telegram通知（LINEのような即時プッシュ）")
-        st.write(
-            "Telegram Bot を使うと、LINEと同様にスマホへ即時通知できます。"
-            " [@BotFather](https://t.me/BotFather) でBotを作成し、"
-            " Botトークンを secrets.toml に設定してください。"
-        )
-        telegram_chat_id = st.text_input(
-            "Telegram Chat ID",
-            value=current_settings.get("Telegram_Chat_ID", ""),
-            placeholder="123456789",
-            help="Botに /start を送ったあと、@userinfobot などで確認できます。",
-        )
-        telegram_enabled = st.checkbox(
-            "Telegram通知を有効にする",
-            value=current_settings.get("Telegram通知") == "有効",
+        line_enabled = st.checkbox(
+            "LINE通知を有効にする",
+            value=current_settings.get("LINE通知") == "有効",
         )
 
         save_settings = st.form_submit_button("設定を保存")
 
     if save_settings:
         new_settings = {
-            "メールアドレス": email_address.strip(),
-            "メール通知": "有効" if email_enabled else "無効",
-            "Telegram_Chat_ID": telegram_chat_id.strip(),
-            "Telegram通知": "有効" if telegram_enabled else "無効",
+            "LINE_User_ID": line_user_id.strip(),
+            "LINE通知": "有効" if line_enabled else "無効",
         }
         try:
             save_notification_settings(new_settings)
@@ -501,6 +550,7 @@ with tab4:
     st.subheader("テスト通知")
     if st.button("テスト通知を送信"):
         test_report = {
+            "記録ID": "test-notification",
             "トリアージ判定": "中・要観察",
             "個体識別番号": "テスト個体",
             "報告者名": "2020-01-01",
@@ -510,7 +560,7 @@ with tab4:
         }
         results = notify_veterinarian(test_report)
         if not results:
-            st.warning("有効な通知チャネルがありません。上でメールまたはTelegramを有効にしてください。")
+            st.warning("LINE通知が無効です。上で「LINE通知を有効にする」にチェックしてください。")
         else:
             for channel, ok, detail in results:
                 if ok:
@@ -518,24 +568,25 @@ with tab4:
                 else:
                     st.error(f"{channel}: {detail}")
 
-    with st.expander("SMTP / Telegram のサーバー設定（管理者向け）"):
+    with st.expander("LINE Messaging API のサーバー設定（管理者向け）"):
         st.code(
             """# .streamlit/secrets.toml に追加
 
-[smtp]
-host = "smtp.gmail.com"
-port = 587
-use_tls = true
-username = "your@gmail.com"
-password = "アプリパスワード"
-from_email = "your@gmail.com"
-
-[telegram]
-bot_token = "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+[line]
+channel_access_token = "YOUR_CHANNEL_ACCESS_TOKEN"
+app_url = "https://your-app.streamlit.app"
 """,
             language="toml",
         )
-        st.write("Googleスプレッドシートには「通知設定」シートを追加してください。")
+        st.write("通知の「状況を確認」ボタンは `app_url?view=dashboard&record_id=...` を開きます。")
+        st.markdown(
+            "**User ID の確認方法（初回のみ）**\n"
+            "1. [webhook.site](https://webhook.site/) で一時URLを取得\n"
+            "2. LINE Developers → Messaging API → Webhook URL にそのURLを設定し「Use webhook」をON\n"
+            "3. 公式LINEに友だち追加してメッセージを送信\n"
+            "4. webhook.site に表示された JSON の `source.userId` をコピー"
+        )
+        st.write("Googleスプレッドシートの「通知設定」シート:")
         st.markdown("| キー | 値 |")
         st.markdown("| --- | --- |")
         for key in NOTIFICATION_SETTINGS_KEYS:
