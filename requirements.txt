@@ -1,0 +1,6 @@
+streamlit
+pandas
+streamlit-gsheets
+google-auth
+google-api-python-client
+requests
