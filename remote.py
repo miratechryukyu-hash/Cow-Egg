@@ -8,6 +8,7 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import os
+import re
 
 # カレンダーのUIを強制的に日本語（日本地域）にする設定
 os.environ["LC_ALL"] = "ja_JP.UTF-8"
@@ -59,11 +60,54 @@ def get_app_url():
     return (line_config.get("app_url") or app_config.get("url") or "").rstrip("/")
 
 
+def get_query_param(name):
+    value = st.query_params.get(name)
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+def normalize_record_id(record_id):
+    if record_id is None:
+        return ""
+    text = str(record_id).strip()
+    if not text or text.lower() in ("nan", "none"):
+        return ""
+    try:
+        return str(int(float(text)))
+    except (ValueError, OverflowError):
+        return text
+
+
+def find_records_by_id(df, record_id):
+    target_id = normalize_record_id(record_id)
+    if not target_id or "記録ID" not in df.columns:
+        return df.iloc[0:0]
+    normalized_ids = df["記録ID"].apply(normalize_record_id)
+    return df[normalized_ids == target_id]
+
+
 def build_dashboard_url(record_id):
     app_url = get_app_url()
     if not app_url:
         return ""
-    return f"{app_url}?view=dashboard&record_id={record_id}"
+    return f"{app_url}?view=dashboard&record_id={normalize_record_id(record_id)}"
+
+
+def is_valid_line_user_id(user_id):
+    return bool(re.fullmatch(r"U[a-f0-9]{32}", user_id, re.IGNORECASE))
+
+
+def line_user_id_error_message(user_id):
+    if is_valid_line_user_id(user_id):
+        return ""
+    if user_id.startswith("@"):
+        return "LINE ID（@から始まる名前）ではなく、User ID（Uから始まる33文字）を入力してください。"
+    return (
+        "LINE User ID の形式が正しくありません。"
+        "「U」から始まる33文字（例: U1234567890abcdef1234567890abcdef）を入力してください。"
+        "LINEの表示名や yakulutooisi のようなIDとは別物です。"
+    )
 
 
 def format_report_message(report, dashboard_url=""):
@@ -155,6 +199,11 @@ def notify_veterinarian(report):
         results.append(("LINE", False, "LINE User IDが未登録です。"))
         return results
 
+    user_id_error = line_user_id_error_message(user_id)
+    if user_id_error:
+        results.append(("LINE", False, user_id_error))
+        return results
+
     ok, detail = send_line_notification(user_id, report)
     results.append(("LINE", ok, detail))
     return results
@@ -189,7 +238,10 @@ def upload_file_to_drive(file_obj):
 # -------------------------------------------------------------------------
 def load_records_df():
     df = conn.read(worksheet="問診記録", ttl=0)
-    return df.fillna("")
+    df = df.fillna("")
+    if "記録ID" in df.columns:
+        df["記録ID"] = df["記録ID"].apply(normalize_record_id)
+    return df
 
 
 def get_registered_animal_ids(df):
@@ -261,9 +313,13 @@ def render_vet_dashboard(focus_record_id=None):
     df = load_records_df()
 
     if focus_record_id:
-        matches = df[df["記録ID"].astype(str) == str(focus_record_id)]
+        matches = find_records_by_id(df, focus_record_id)
         if matches.empty:
-            st.error("指定された報告が見つかりません。")
+            st.error(
+                f"指定された報告が見つかりません。"
+                f"（記録ID: {normalize_record_id(focus_record_id)}）"
+            )
+            st.caption("テスト通知のリンクはスプレッドシートに記録がないため開けません。現場からの実際の報告でお試しください。")
             return
 
         row_idx = matches.index[0]
@@ -292,12 +348,13 @@ def render_vet_dashboard(focus_record_id=None):
 
 
 # LINE通知のURLから開いた場合は、該当報告のダッシュボードを直接表示
-if st.query_params.get("view") == "dashboard":
+if get_query_param("view") == "dashboard":
     st.header("獣医師用ダッシュボード")
-    if st.query_params.get("record_id"):
+    focus_record_id = get_query_param("record_id")
+    if focus_record_id:
         st.info("LINE通知から開きました。該当の報告を表示しています。")
     try:
-        render_vet_dashboard(focus_record_id=st.query_params.get("record_id"))
+        render_vet_dashboard(focus_record_id=focus_record_id)
     except Exception as e:
         st.error(f"データ読み込みエラー: {e}")
     st.stop()
@@ -373,11 +430,12 @@ with tab1:
                             st.error(f"ファイルのアップロードに失敗しました: {e}")
                             file_id = "アップロード失敗"
 
+                    record_id = str(int(datetime.now(timezone(timedelta(hours=+9))).timestamp()))
                     now_jst = datetime.now(timezone(timedelta(hours=+9))).strftime("%Y-%m-%d %H:%M")
                     birth_date_str = birth_date.strftime("%Y-%m-%d")
                     
                     new_row = {
-                        "記録ID": str(int(datetime.now().timestamp())),
+                        "記録ID": record_id,
                         "日時": now_jst,
                         "報告者名": birth_date_str,
                         "個体識別番号": animal_id,
@@ -515,15 +573,19 @@ with tab4:
         st.subheader("LINE通知")
         st.markdown(
             "1. [LINE Developers](https://developers.line.biz/) で Messaging API チャネル（公式アカウント）を作成\n"
-            "2. **Channel access token** を管理者が `secrets.toml` に設定\n"
+            "2. **Channel access token** を管理者が Secrets に設定\n"
             "3. 獣医師が公式LINEアカウントを**友だち追加**し、任意のメッセージを送信\n"
-            "4. Webhook ログ等で確認した **User ID** を下に入力"
+            "4. Webhook ログ等で確認した **User ID（Uから始まる33文字）** を下に入力"
+        )
+        st.warning(
+            "「yakulutooisi」のような LINE ID や表示名では通知できません。"
+            "必ず `U` から始まる User ID を入力してください。"
         )
         line_user_id = st.text_input(
             "LINE User ID",
             value=current_settings.get("LINE_User_ID", ""),
-            placeholder="Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-            help="友だち追加後にメッセージを送ると Webhook ログに表示されます。",
+            placeholder="U1234567890abcdef1234567890abcdef",
+            help="Webhook ログの source.userId をコピーしてください。",
         )
         line_enabled = st.checkbox(
             "LINE通知を有効にする",
