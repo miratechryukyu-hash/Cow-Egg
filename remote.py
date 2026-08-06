@@ -242,23 +242,61 @@ def notify_veterinarian(report):
 # 画像・動画をGoogleドライブにアップロードする汎用関数
 # -------------------------------------------------------------------------
 def upload_file_to_drive(file_obj):
-    FOLDER_ID = '1_5WgaqG2hkVswPqsrHlthke5-j0H8rnF'
-    
+    FOLDER_ID = "1_5WgaqG2hkVswPqsrHlthke5-j0H8rnF"
+
     creds_dict = dict(st.secrets["connections"]["gsheets"])
-    creds = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/drive"])
-    drive_service = build('drive', 'v3', credentials=creds)
-    
-    prefix = "video" if "video" in file_obj.type else "photo"
+    creds = Credentials.from_service_account_info(
+        creds_dict,
+        scopes=[
+            "https://www.googleapis.com/auth/drive.file",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+    drive_service = build("drive", "v3", credentials=creds)
+
+    file_bytes = file_obj.getvalue()
+    if not file_bytes:
+        raise ValueError("ファイルが空です。もう一度選択してください。")
+
+    file_size_mb = len(file_bytes) / (1024 * 1024)
+    if file_size_mb > 200:
+        raise ValueError(f"ファイルが大きすぎます（{file_size_mb:.1f}MB）。200MB以下にしてください。")
+
+    mime_type = file_obj.type or "application/octet-stream"
+    prefix = "video" if "video" in mime_type else "photo"
     file_name = f"{prefix}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{file_obj.name}"
-    
-    file_metadata = {'name': file_name, 'parents': [FOLDER_ID]}
-    media = MediaIoBaseUpload(io.BytesIO(file_obj.getvalue()), mimetype=file_obj.type, resumable=True)
-    
-    file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-    file_id = file.get('id')
-    
-    drive_service.permissions().create(fileId=file_id, body={'type': 'anyone', 'role': 'reader'}).execute()
-    
+
+    file_metadata = {"name": file_name, "parents": [FOLDER_ID]}
+    media = MediaIoBaseUpload(
+        io.BytesIO(file_bytes),
+        mimetype=mime_type,
+        resumable=file_size_mb > 8,
+    )
+
+    try:
+        file = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id",
+            supportsAllDrives=True,
+        ).execute()
+        file_id = file.get("id")
+
+        drive_service.permissions().create(
+            fileId=file_id,
+            body={"type": "anyone", "role": "reader"},
+            supportsAllDrives=True,
+        ).execute()
+    except Exception as error:
+        message = str(error)
+        if "storageQuotaExceeded" in message or "Service Accounts do not have storage quota" in message:
+            service_email = creds_dict.get("client_email", "サービスアカウント")
+            raise RuntimeError(
+                "Google Drive へのアップロード権限がありません。"
+                f"アップロード先フォルダを {service_email} と「編集者」で共有してください。"
+            ) from error
+        raise
+
     return file_id
 
 
@@ -316,6 +354,11 @@ def sort_records_by_datetime(df):
 
 
 def render_media(file_data):
+    text = str(file_data).strip()
+    if text == "アップロード失敗":
+        st.error("メディアのアップロードに失敗しました。報告フォームから再度送信してください。")
+        return
+
     media_type, file_id = parse_media_ref(file_data)
     if not file_id:
         st.info("メディア添付なし")
@@ -457,6 +500,15 @@ with tab1:
     else:
         default_animal_id = ""
 
+    uploaded_file = st.file_uploader(
+        "患部の写真または動画をアップロード",
+        type=["jpg", "jpeg", "png", "mp4", "mov"],
+        key="report_media_file",
+    )
+    if uploaded_file is not None:
+        file_size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
+        st.caption(f"選択中: {uploaded_file.name}（{uploaded_file.type or '不明'} / {file_size_mb:.1f}MB）")
+
     with st.form("report_form", clear_on_submit=False):
         animal_id = st.text_input("個体識別番号 / 名前", value=default_animal_id)
         birth_date = st.date_input(
@@ -470,8 +522,6 @@ with tab1:
             "主な症状（複数選択可）",
             ["食欲不振", "歩行異常", "出血", "下痢・嘔吐", "ぐったりしている", "その他"]
         )
-        
-        uploaded_file = st.file_uploader("患部の写真または動画をアップロード", type=["jpg", "jpeg", "png", "mp4", "mov"])
         
         confirm_send = st.checkbox("すべての入力が完了しました（チェックを入れてから送信）")
         submit_button = st.form_submit_button("報告を送信する")
@@ -490,10 +540,11 @@ with tab1:
                         triage = "中・要観察"
                     
                     file_id = "ファイルなし"
-                    if uploaded_file is not None:
+                    media_file = uploaded_file or st.session_state.get("report_media_file")
+                    if media_file is not None:
                         try:
-                            media_type = "video" if "video" in uploaded_file.type else "photo"
-                            drive_file_id = upload_file_to_drive(uploaded_file)
+                            media_type = "video" if "video" in (media_file.type or "") else "photo"
+                            drive_file_id = upload_file_to_drive(media_file)
                             file_id = format_media_ref(drive_file_id, media_type)
                         except Exception as e:
                             st.error(f"ファイルのアップロードに失敗しました: {e}")
