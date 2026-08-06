@@ -15,7 +15,7 @@ os.environ["LANG"] = "ja_JP.UTF-8"
 
 st.set_page_config(page_title="動物遠隔診療MVP", layout="wide")
 
-st.title("動物遠隔診療サポートシステム")
+st.title("遠隔診療システム")
 
 # Googleスプレッドシートへの接続設定
 conn = st.connection("gsheets", type=GSheetsConnection)
