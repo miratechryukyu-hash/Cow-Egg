@@ -22,6 +22,10 @@ st.title("遠隔診療システム")
 # Googleスプレッドシートへの接続設定
 conn = st.connection("gsheets", type=GSheetsConnection)
 
+SHEET_READ_TTL = 60
+RECORDS_CACHE_KEY = "cached_records_df"
+NOTIFICATION_CACHE_KEY = "cached_notification_settings"
+
 NOTIFICATION_SETTINGS_KEYS = [
     "LINE_User_ID",
     "LINE通知",
@@ -35,16 +39,39 @@ DEFAULT_NOTIFICATION_SETTINGS = {
 # -------------------------------------------------------------------------
 # 通知設定の読み書き
 # -------------------------------------------------------------------------
-def load_notification_settings():
+def clear_sheet_cache(*, records=True, notifications=True):
+    if records:
+        st.session_state.pop(RECORDS_CACHE_KEY, None)
+    if notifications:
+        st.session_state.pop(NOTIFICATION_CACHE_KEY, None)
+
+
+def sheet_read_error_message(error):
+    message = str(error)
+    if "429" in message or "RESOURCE_EXHAUSTED" in message or "RATE_LIMIT_EXCEEDED" in message:
+        return (
+            "Googleスプレッドシートへの読み取りが多すぎます。"
+            "1分ほど待ってからページを再読み込みしてください。"
+        )
+    return f"データ読み込みエラー: {error}"
+
+
+def load_notification_settings(*, refresh=False):
+    if refresh:
+        st.session_state.pop(NOTIFICATION_CACHE_KEY, None)
+    if NOTIFICATION_CACHE_KEY in st.session_state:
+        return st.session_state[NOTIFICATION_CACHE_KEY].copy()
+
     try:
-        df = conn.read(worksheet="通知設定", ttl=0)
+        df = conn.read(worksheet="通知設定", ttl=SHEET_READ_TTL)
         df = df.fillna("")
         settings = DEFAULT_NOTIFICATION_SETTINGS.copy()
         for _, row in df.iterrows():
             key = str(row.get("キー", "")).strip()
             if key in settings:
                 settings[key] = str(row.get("値", "")).strip()
-        return settings
+        st.session_state[NOTIFICATION_CACHE_KEY] = settings
+        return settings.copy()
     except Exception:
         return DEFAULT_NOTIFICATION_SETTINGS.copy()
 
@@ -53,6 +80,7 @@ def save_notification_settings(settings):
     rows = [{"キー": key, "値": settings.get(key, "")} for key in NOTIFICATION_SETTINGS_KEYS]
     df = pd.DataFrame(rows)
     conn.update(worksheet="通知設定", data=df)
+    st.session_state[NOTIFICATION_CACHE_KEY] = settings.copy()
 
 
 def get_app_url():
@@ -252,11 +280,17 @@ def parse_media_ref(file_data):
 # -------------------------------------------------------------------------
 # 問診記録の読み込み・表示
 # -------------------------------------------------------------------------
-def load_records_df():
-    df = conn.read(worksheet="問診記録", ttl=0)
+def load_records_df(*, refresh=False):
+    if refresh:
+        st.session_state.pop(RECORDS_CACHE_KEY, None)
+    if RECORDS_CACHE_KEY in st.session_state:
+        return st.session_state[RECORDS_CACHE_KEY]
+
+    df = conn.read(worksheet="問診記録", ttl=SHEET_READ_TTL)
     df = df.fillna("")
     if "記録ID" in df.columns:
         df["記録ID"] = df["記録ID"].apply(normalize_record_id)
+    st.session_state[RECORDS_CACHE_KEY] = df
     return df
 
 
@@ -323,6 +357,7 @@ def render_report_detail(df, row_idx, row, *, allow_complete=True):
                 df.loc[row_idx, "確認ステータス"] = "対応完了"
                 df.loc[row_idx, "獣医師コメント"] = comment
                 conn.update(worksheet="問診記録", data=df)
+                clear_sheet_cache(records=True, notifications=False)
                 st.success("ステータスとコメントを更新しました。")
                 st.rerun()
         elif row["確認ステータス"] == "対応完了":
@@ -332,8 +367,9 @@ def render_report_detail(df, row_idx, row, *, allow_complete=True):
         render_media(row["患部写真"])
 
 
-def render_vet_dashboard(focus_record_id=None):
-    df = load_records_df()
+def render_vet_dashboard(focus_record_id=None, df=None):
+    if df is None:
+        df = load_records_df()
 
     if focus_record_id:
         matches = find_records_by_id(df, focus_record_id)
@@ -379,8 +415,16 @@ if get_query_param("view") == "dashboard":
     try:
         render_vet_dashboard(focus_record_id=focus_record_id)
     except Exception as e:
-        st.error(f"データ読み込みエラー: {e}")
+        st.error(sheet_read_error_message(e))
     st.stop()
+
+
+# 問診記録は1回だけ読み込み、各タブで使い回す
+try:
+    shared_records_df = load_records_df()
+except Exception as e:
+    shared_records_df = None
+    shared_records_error = sheet_read_error_message(e)
 
 
 # タブの作成
@@ -397,11 +441,11 @@ tab1, tab2, tab3, tab4 = st.tabs([
 with tab1:
     st.header("現場報告入力")
 
-    try:
-        all_records_df = load_records_df()
-        registered_animal_ids = get_registered_animal_ids(all_records_df)
-    except Exception:
+    if shared_records_df is None:
+        st.error(shared_records_error)
         registered_animal_ids = []
+    else:
+        registered_animal_ids = get_registered_animal_ids(shared_records_df)
 
     if registered_animal_ids:
         quick_pick = st.selectbox(
@@ -474,9 +518,10 @@ with tab1:
                     new_data = pd.DataFrame([new_row])
                     
                     try:
-                        existing_data = load_records_df()
+                        existing_data = load_records_df(refresh=True)
                         updated_data = pd.concat([existing_data, new_data], ignore_index=True)
                         conn.update(worksheet="問診記録", data=updated_data)
+                        clear_sheet_cache(records=True, notifications=False)
                         st.success(f"スプレッドシートへの送信が完了しました。 判定結果: {triage}")
 
                         notification_results = notify_veterinarian(new_row)
@@ -497,10 +542,10 @@ with tab1:
 with tab2:
     st.header("未対応の報告一覧")
 
-    try:
-        render_vet_dashboard()
-    except Exception as e:
-        st.error(f"データ読み込みエラー: {e}")
+    if shared_records_df is None:
+        st.error(shared_records_error)
+    else:
+        render_vet_dashboard(df=shared_records_df)
 
 # -------------------------------------------------------------------------
 # タブ3: 個体履歴照会
@@ -509,8 +554,10 @@ with tab3:
     st.header("個体別 過去記録")
     st.caption("登録済みの個体番号を選ぶか、検索して過去の報告を確認できます。")
 
-    try:
-        history_df = load_records_df()
+    if shared_records_df is None:
+        st.error(shared_records_error)
+    else:
+        history_df = shared_records_df
         registered_ids = get_registered_animal_ids(history_df)
 
         if not registered_ids:
@@ -581,9 +628,6 @@ with tab3:
                             st.write(f"**獣医師コメント:** {detail_row['獣医師コメント']}")
                     with detail_col2:
                         render_media(detail_row["患部写真"])
-
-    except Exception as e:
-        st.error(f"データ読み込みエラー: {e}")
 
 # -------------------------------------------------------------------------
 # タブ4: 通知設定
