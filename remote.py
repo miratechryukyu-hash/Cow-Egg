@@ -332,9 +332,28 @@ def load_records_df(*, refresh=False):
     return df
 
 
+def normalize_animal_id(animal_id):
+    text = str(animal_id).strip()
+    if not text or text.lower() in ("nan", "none"):
+        return ""
+    try:
+        number = float(text)
+        if number.is_integer():
+            return str(int(number))
+    except ValueError:
+        pass
+    return text
+
+
 def get_registered_animal_ids(df):
-    ids = df["個体識別番号"].astype(str).str.strip()
+    ids = df["個体識別番号"].apply(normalize_animal_id)
     return sorted(ids[ids != ""].unique().tolist())
+
+
+def filter_records_by_animal_id(df, animal_id):
+    target = normalize_animal_id(animal_id)
+    normalized = df["個体識別番号"].apply(normalize_animal_id)
+    return df[normalized == target]
 
 
 def filter_animal_ids(animal_ids, search_query):
@@ -628,57 +647,61 @@ with tab3:
                     "個体を選択",
                     filtered_ids,
                     format_func=lambda animal_id: (
-                        f"{animal_id}（{len(history_df[history_df['個体識別番号'] == animal_id])}件）"
+                        f"{animal_id}（{len(filter_records_by_animal_id(history_df, animal_id))}件）"
                     ),
                     key="history_animal_select",
                 )
 
                 animal_records = sort_records_by_datetime(
-                    history_df[history_df["個体識別番号"] == selected_animal_id]
-                )
-                latest_record = animal_records.iloc[0]
-
-                col1, col2, col3 = st.columns(3)
-                col1.metric("報告回数", f"{len(animal_records)} 件")
-                col2.metric("最新報告", latest_record["日時"])
-                col3.metric("生年月日", latest_record["報告者名"])
-
-                st.divider()
-                st.subheader("報告一覧")
-
-                summary_df = animal_records[[
-                    "日時", "体温", "主な症状", "トリアージ判定", "確認ステータス", "獣医師コメント"
-                ]].copy()
-                st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
-                record_options = animal_records.index.tolist()
-
-                def format_history_option(idx):
-                    row = animal_records.loc[idx]
-                    return f"{row['日時']} — {row['トリアージ判定']}（{row['確認ステータス']}）"
-
-                selected_record_idx = st.selectbox(
-                    "詳細を見る報告を選択",
-                    record_options,
-                    format_func=format_history_option,
-                    key="history_record_select",
+                    filter_records_by_animal_id(history_df, selected_animal_id)
                 )
 
-                if selected_record_idx is not None:
-                    detail_row = animal_records.loc[selected_record_idx]
-                    st.markdown(f"### 【{detail_row['トリアージ判定']}】 {selected_animal_id}")
+                if animal_records.empty:
+                    st.warning("選択した個体の記録が見つかりません。")
+                else:
+                    latest_record = animal_records.iloc[0]
 
-                    detail_col1, detail_col2 = st.columns([2, 1])
-                    with detail_col1:
-                        st.write(f"**報告日時:** {detail_row['日時']}")
-                        st.write(f"**牛の生年月日:** {detail_row['報告者名']}")
-                        st.write(f"**体温:** {detail_row['体温']} ℃")
-                        st.write(f"**症状:** {detail_row['主な症状'] or 'なし'}")
-                        st.write(f"**確認ステータス:** {detail_row['確認ステータス']}")
-                        if detail_row["獣医師コメント"]:
-                            st.write(f"**獣医師コメント:** {detail_row['獣医師コメント']}")
-                    with detail_col2:
-                        render_media(detail_row["患部写真"])
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("報告回数", f"{len(animal_records)} 件")
+                    col2.metric("最新報告", latest_record["日時"])
+                    col3.metric("生年月日", latest_record["報告者名"])
+
+                    st.divider()
+                    st.subheader("報告一覧")
+
+                    summary_df = animal_records[[
+                        "日時", "体温", "主な症状", "トリアージ判定", "確認ステータス", "獣医師コメント"
+                    ]].copy()
+                    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+                    record_options = animal_records.index.tolist()
+
+                    def format_history_option(idx):
+                        row = animal_records.loc[idx]
+                        return f"{row['日時']} — {row['トリアージ判定']}（{row['確認ステータス']}）"
+
+                    selected_record_idx = st.selectbox(
+                        "詳細を見る報告を選択",
+                        record_options,
+                        format_func=format_history_option,
+                        key="history_record_select",
+                    )
+
+                    if selected_record_idx is not None:
+                        detail_row = animal_records.loc[selected_record_idx]
+                        st.markdown(f"### 【{detail_row['トリアージ判定']}】 {selected_animal_id}")
+
+                        detail_col1, detail_col2 = st.columns([2, 1])
+                        with detail_col1:
+                            st.write(f"**報告日時:** {detail_row['日時']}")
+                            st.write(f"**牛の生年月日:** {detail_row['報告者名']}")
+                            st.write(f"**体温:** {detail_row['体温']} ℃")
+                            st.write(f"**症状:** {detail_row['主な症状'] or 'なし'}")
+                            st.write(f"**確認ステータス:** {detail_row['確認ステータス']}")
+                            if detail_row["獣医師コメント"]:
+                                st.write(f"**獣医師コメント:** {detail_row['獣医師コメント']}")
+                        with detail_col2:
+                            render_media(detail_row["患部写真"])
 
 # -------------------------------------------------------------------------
 # タブ4: 通知設定
