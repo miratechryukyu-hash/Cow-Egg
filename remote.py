@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from streamlit_gsheets import GSheetsConnection
@@ -233,6 +234,21 @@ def upload_file_to_drive(file_obj):
     return file_id
 
 
+def format_media_ref(file_id, media_type):
+    return f"{media_type}:{file_id}"
+
+
+def parse_media_ref(file_data):
+    text = str(file_data).strip()
+    if not text or text in ["ファイルなし", "写真なし", "アップロード失敗"]:
+        return None, None
+    if text.startswith("video:"):
+        return "video", text[6:]
+    if text.startswith("photo:"):
+        return "photo", text[6:]
+    return "unknown", text
+
+
 # -------------------------------------------------------------------------
 # 問診記録の読み込み・表示
 # -------------------------------------------------------------------------
@@ -266,19 +282,26 @@ def sort_records_by_datetime(df):
 
 
 def render_media(file_data):
-    if file_data and file_data not in ["ファイルなし", "写真なし", "アップロード失敗"]:
-        media_url = f"https://drive.google.com/uc?id={file_data}"
-        if "video" in str(file_data) or str(file_data).startswith("video"):
-            st.video(media_url)
-            st.caption("現場からの動画")
-        else:
-            try:
-                st.image(media_url, caption="現場からの写真", use_container_width=True)
-            except Exception:
-                st.video(media_url)
-                st.caption("現場からの動画")
-    else:
+    media_type, file_id = parse_media_ref(file_data)
+    if not file_id:
         st.info("メディア添付なし")
+        return
+
+    preview_url = f"https://drive.google.com/file/d/{file_id}/preview"
+    open_url = f"https://drive.google.com/file/d/{file_id}/view"
+
+    if media_type in ("video", "unknown"):
+        components.iframe(preview_url, height=360, scrolling=True)
+        st.caption("現場からの動画")
+    else:
+        image_url = f"https://drive.google.com/uc?id={file_id}"
+        try:
+            st.image(image_url, caption="現場からの写真", use_container_width=True)
+        except Exception:
+            components.iframe(preview_url, height=360, scrolling=True)
+            st.caption("現場からの写真")
+
+    st.link_button("Google Driveで開く", open_url, use_container_width=True)
 
 
 def render_report_detail(df, row_idx, row, *, allow_complete=True):
@@ -425,7 +448,9 @@ with tab1:
                     file_id = "ファイルなし"
                     if uploaded_file is not None:
                         try:
-                            file_id = upload_file_to_drive(uploaded_file)
+                            media_type = "video" if "video" in uploaded_file.type else "photo"
+                            drive_file_id = upload_file_to_drive(uploaded_file)
+                            file_id = format_media_ref(drive_file_id, media_type)
                         except Exception as e:
                             st.error(f"ファイルのアップロードに失敗しました: {e}")
                             file_id = "アップロード失敗"
