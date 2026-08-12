@@ -29,11 +29,15 @@ NOTIFICATION_CACHE_KEY = "cached_notification_settings"
 NOTIFICATION_SETTINGS_KEYS = [
     "LINE_User_ID",
     "LINE通知",
+    "現場_LINE_User_ID",
+    "現場_LINE通知",
 ]
 
 DEFAULT_NOTIFICATION_SETTINGS = {
     "LINE_User_ID": "",
     "LINE通知": "無効",
+    "現場_LINE_User_ID": "",
+    "現場_LINE通知": "無効",
 }
 
 # -------------------------------------------------------------------------
@@ -161,38 +165,39 @@ def build_line_messages(report):
         f"個体: {report['個体識別番号']}\n"
         f"体温: {report['体温']}℃\n"
         f"症状: {report['主な症状'] or 'なし'}\n"
-        f"日時: {report['日時']}"
+        f"日時: {report['日時']}\n\n"
+        "返信・指示はこのLINEトークに\n"
+        "メッセージを送ってください。"
     )
 
+    messages = [{"type": "text", "text": summary}]
+
     if dashboard_url:
-        return [
+        messages.append(
             {
                 "type": "template",
-                "altText": f"新しい現場報告: {report['個体識別番号']}",
+                "altText": f"報告メディア: {report['個体識別番号']}",
                 "template": {
                     "type": "buttons",
-                    "text": summary[:160],
+                    "text": "写真・動画がある場合はこちらから確認できます。",
                     "actions": [
                         {
                             "type": "uri",
-                            "label": "状況を確認",
+                            "label": "写真・動画を見る",
                             "uri": dashboard_url,
                         }
                     ],
                 },
             }
-        ]
+        )
 
-    return [{"type": "text", "text": format_report_message(report)}]
+    return messages
 
 
 def send_line_notification(user_id, report):
     line_config = st.secrets.get("line")
     if not line_config or not line_config.get("channel_access_token"):
         return False, "LINE設定（secrets.toml の [line] channel_access_token）がありません。"
-
-    if not get_app_url():
-        return False, "アプリURL（secrets.toml の [line] app_url）がありません。"
 
     try:
         response = requests.post(
@@ -216,25 +221,73 @@ def send_line_notification(user_id, report):
         return False, f"LINE送信エラー: {e}"
 
 
+def send_line_text(user_id, message):
+    line_config = st.secrets.get("line")
+    if not line_config or not line_config.get("channel_access_token"):
+        return False, "LINE設定がありません。"
+
+    try:
+        response = requests.post(
+            "https://api.line.me/v2/bot/message/push",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {line_config['channel_access_token']}",
+            },
+            json={
+                "to": user_id,
+                "messages": [{"type": "text", "text": message}],
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        return True, "LINEに送信しました。"
+    except requests.HTTPError as e:
+        detail = e.response.text if e.response is not None else str(e)
+        return False, f"LINE送信エラー: {detail}"
+    except Exception as e:
+        return False, f"LINE送信エラー: {e}"
+
+
+def notify_line_recipient(user_id, report, label):
+    user_id = user_id.strip()
+    if not user_id:
+        return []
+
+    user_id_error = line_user_id_error_message(user_id)
+    if user_id_error:
+        return [(label, False, user_id_error)]
+
+    ok, detail = send_line_notification(user_id, report)
+    return [(label, ok, detail)]
+
+
 def notify_veterinarian(report):
     settings = load_notification_settings()
     results = []
 
-    if settings.get("LINE通知") != "有効":
-        return results
+    if settings.get("LINE通知") == "有効":
+        results.extend(
+            notify_line_recipient(settings.get("LINE_User_ID", ""), report, "獣医師")
+        )
 
-    user_id = settings.get("LINE_User_ID", "").strip()
-    if not user_id:
-        results.append(("LINE", False, "LINE User IDが未登録です。"))
-        return results
+    if settings.get("現場_LINE通知") == "有効":
+        farm_message = (
+            f"【報告送信完了】\n"
+            f"個体: {report['個体識別番号']}\n"
+            f"判定: {report['トリアージ判定']}\n\n"
+            "獣医師からの返信はこのLINEに届きます。"
+        )
+        farm_user_id = settings.get("現場_LINE_User_ID", "").strip()
+        if not farm_user_id:
+            results.append(("現場", False, "現場 LINE User IDが未登録です。"))
+        else:
+            farm_error = line_user_id_error_message(farm_user_id)
+            if farm_error:
+                results.append(("現場", False, farm_error))
+            else:
+                ok, detail = send_line_text(farm_user_id, farm_message)
+                results.append(("現場", ok, detail))
 
-    user_id_error = line_user_id_error_message(user_id)
-    if user_id_error:
-        results.append(("LINE", False, user_id_error))
-        return results
-
-    ok, detail = send_line_notification(user_id, report)
-    results.append(("LINE", ok, detail))
     return results
 
 
@@ -400,7 +453,7 @@ def render_media(file_data):
     st.link_button("Google Driveで開く", open_url, use_container_width=True)
 
 
-def render_report_detail(df, row_idx, row, *, allow_complete=True):
+def render_report_detail(df, row_idx, row, *, read_only=False):
     st.markdown(f"### 【{row['トリアージ判定']}】 個体: {row['個体識別番号']}")
 
     col1, col2 = st.columns([2, 1])
@@ -410,10 +463,15 @@ def render_report_detail(df, row_idx, row, *, allow_complete=True):
         st.write(f"**体温:** {row['体温']} ℃")
         st.write(f"**症状:** {row['主な症状'] or 'なし'}")
         st.write(f"**確認ステータス:** {row['確認ステータス']}")
-        if row["獣医師コメント"]:
+        if read_only:
+            st.info(
+                "報告後のやり取りは **公式LINE** で行います。"
+                "指示・返信はLINEトークにメッセージを送ってください。"
+            )
+        elif row["獣医師コメント"]:
             st.write(f"**獣医師コメント:** {row['獣医師コメント']}")
 
-        if allow_complete and row["確認ステータス"] == "未確認":
+        if not read_only and row["確認ステータス"] == "未確認":
             comment = st.text_area("指示・コメントを入力", key=f"comment_{row_idx}")
             if st.button("対応完了にする", key=f"btn_{row_idx}"):
                 df.loc[row_idx, "確認ステータス"] = "対応完了"
@@ -422,7 +480,7 @@ def render_report_detail(df, row_idx, row, *, allow_complete=True):
                 clear_sheet_cache(records=True, notifications=False)
                 st.success("ステータスとコメントを更新しました。")
                 st.rerun()
-        elif row["確認ステータス"] == "対応完了":
+        elif not read_only and row["確認ステータス"] == "対応完了":
             st.info("この報告は対応済みです。")
 
     with col2:
@@ -445,7 +503,7 @@ def render_vet_dashboard(focus_record_id=None, df=None):
 
         row_idx = matches.index[0]
         row = matches.iloc[0]
-        render_report_detail(df, row_idx, row)
+        render_report_detail(df, row_idx, row, read_only=True)
         return
 
     unconfirmed_df = df[df["確認ステータス"] == "未確認"]
@@ -465,7 +523,7 @@ def render_vet_dashboard(focus_record_id=None, df=None):
     if selected_idx is not None:
         row = unconfirmed_df.loc[selected_idx]
         with st.container():
-            render_report_detail(df, selected_idx, row)
+            render_report_detail(df, selected_idx, row, read_only=True)
 
 
 # LINE通知のURLから開いた場合は、該当報告のダッシュボードを直接表示
@@ -502,6 +560,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # -------------------------------------------------------------------------
 with tab1:
     st.header("現場報告入力")
+    st.caption("チェックボックスで報告します。報告後のやり取りは公式LINEで行います。")
 
     if shared_records_df is None:
         st.error(shared_records_error)
@@ -610,7 +669,8 @@ with tab1:
 # タブ2: 獣医師用ダッシュボード
 # -------------------------------------------------------------------------
 with tab2:
-    st.header("未対応の報告一覧")
+    st.header("報告内容の確認")
+    st.caption("閲覧専用です。返信・指示は公式LINEで行います。")
 
     if shared_records_df is None:
         st.error(shared_records_error)
@@ -707,32 +767,33 @@ with tab3:
 # タブ4: 通知設定
 # -------------------------------------------------------------------------
 with tab4:
-    st.header("獣医師へのLINE通知設定")
-    st.caption("現場から報告が送信されたとき、獣医師のLINEへプッシュ通知します。")
+    st.header("LINE連絡設定")
+    st.caption("報告はアプリ、報告後のやり取りは公式LINEで行います。")
 
     current_settings = load_notification_settings()
 
     with st.form("notification_settings_form"):
-        st.subheader("LINE通知")
-        st.markdown(
-            "1. [LINE Developers](https://developers.line.biz/) で Messaging API チャネル（公式アカウント）を作成\n"
-            "2. **Channel access token** を管理者が Secrets に設定\n"
-            "3. 獣医師が公式LINEアカウントを**友だち追加**し、任意のメッセージを送信\n"
-            "4. Webhook ログ等で確認した **User ID（Uから始まる33文字）** を下に入力"
-        )
-        st.warning(
-            "「yakulutooisi」のような LINE ID や表示名では通知できません。"
-            "必ず `U` から始まる User ID を入力してください。"
-        )
+        st.subheader("獣医師（通知を受け取る人）")
         line_user_id = st.text_input(
-            "LINE User ID",
+            "獣医師 LINE User ID",
             value=current_settings.get("LINE_User_ID", ""),
             placeholder="U1234567890abcdef1234567890abcdef",
-            help="Webhook ログの source.userId をコピーしてください。",
         )
         line_enabled = st.checkbox(
-            "LINE通知を有効にする",
+            "獣医師への報告通知を有効にする",
             value=current_settings.get("LINE通知") == "有効",
+        )
+
+        st.divider()
+        st.subheader("現場担当者（返信を受け取る人）")
+        farm_line_user_id = st.text_input(
+            "現場 LINE User ID",
+            value=current_settings.get("現場_LINE_User_ID", ""),
+            placeholder="U1234567890abcdef1234567890abcdef",
+        )
+        farm_line_enabled = st.checkbox(
+            "現場への受付確認・返信通知を有効にする",
+            value=current_settings.get("現場_LINE通知") == "有効",
         )
 
         save_settings = st.form_submit_button("設定を保存")
@@ -741,6 +802,8 @@ with tab4:
         new_settings = {
             "LINE_User_ID": line_user_id.strip(),
             "LINE通知": "有効" if line_enabled else "無効",
+            "現場_LINE_User_ID": farm_line_user_id.strip(),
+            "現場_LINE通知": "有効" if farm_line_enabled else "無効",
         }
         try:
             save_notification_settings(new_settings)
@@ -750,6 +813,17 @@ with tab4:
                 f"設定の保存に失敗しました: {e}\n\n"
                 "Googleスプレッドシートに「通知設定」シート（列: キー, 値）を作成してください。"
             )
+
+    st.divider()
+    st.subheader("LINEでのやり取りの設定")
+    st.markdown(
+        "1. **獣医師・現場担当者** が公式LINEを友だち追加し、User ID を上に登録\n"
+        "2. [LINE Official Account Manager](https://manager.line.biz/) → **設定 → 応答設定**\n"
+        "   - 自動応答の「個別のお問い合わせを受け付けておりません」を **OFF**\n"
+        "   - **Webhook** を ON\n"
+        "3. `line_webhook.gs` を Google Apps Script にデプロイし、Webhook URL を LINE Developers に設定\n"
+        "4. 以降、獣医師 ↔ 現場 のメッセージが公式LINE経由で **相互に転送** されます"
+    )
 
     st.divider()
     st.subheader("テスト通知")
