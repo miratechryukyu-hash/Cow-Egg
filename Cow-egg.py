@@ -296,6 +296,33 @@ def sort_predictions_for_display(predictions: list) -> list:
     return sorted(predictions, key=sort_key)
 
 
+def is_rank_label(class_name: str) -> bool:
+    """EB-A や BL-A のような評価ランクだけを残す。検出用ラベルは除外する。"""
+    text = str(class_name or "").strip()
+    if not text or text == "判定不能":
+        return False
+    lowered = text.lower().replace("_", "-").replace(" ", "")
+    if "detect" in lowered or "検出" in text:
+        return False
+    return "-" in text and len(text) <= 12
+
+
+def rank_predictions(predictions: list) -> list:
+    ranked = [
+        pred for pred in predictions
+        if isinstance(pred, dict) and is_rank_label(pred.get("class", ""))
+    ]
+    return sort_predictions_for_display(ranked)
+    def sort_key(pred):
+        box = prediction_bbox(pred)
+        if box is None:
+            return (10**9, 10**9)
+        x1, y1, x2, y2 = box
+        return ((y1 + y2) / 2, (x1 + x2) / 2)
+
+    return sorted(predictions, key=sort_key)
+
+
 def load_label_font(image_width: int):
     size = max(18, image_width // 45)
     for path in (
@@ -316,21 +343,45 @@ def text_pixel_size(draw: ImageDraw.ImageDraw, text: str, font) -> tuple[int, in
     return width, height
 
 
+FIXED_GRADE_COLORS = {
+    "EB-A": (220, 38, 38),
+    "EB-B": (217, 119, 6),
+    "EB-C": (124, 58, 237),
+    "BL-A": (22, 163, 74),
+    "BL-B": (37, 99, 235),
+    "BL-C": (8, 145, 178),
+}
+
+
+def grade_color(grade: str, fallback_index: int) -> tuple[int, int, int]:
+    return FIXED_GRADE_COLORS.get(grade, GRADE_COLORS[fallback_index % len(GRADE_COLORS)])
+
+
 def annotate_embryos(image: Image.Image, predictions: list) -> Image.Image:
     annotated = image.copy()
     draw = ImageDraw.Draw(annotated)
     width, height = annotated.size
-    font = load_label_font(width)
-    line_width = max(3, width // 280)
-
-    grades = []
+    box_heights = []
     for pred in predictions:
-        grade = str(pred.get("class", "判定不能"))
-        if grade not in grades:
-            grades.append(grade)
-    color_of = {grade: GRADE_COLORS[i % len(GRADE_COLORS)] for i, grade in enumerate(grades)}
+        box = prediction_bbox(pred)
+        if box is None:
+            continue
+        box_heights.append(max(1.0, box[3] - box[1]))
+    typical = sorted(box_heights)[len(box_heights) // 2] if box_heights else width / 20
+    font = load_label_font(int(max(80, min(width, typical * 8))))
+    line_width = max(2, int(typical / 18))
 
-    for index, pred in enumerate(predictions, start=1):
+    seen_grades = []
+    for pred in predictions:
+        grade = str(pred.get("class", "")).strip()
+        if grade not in seen_grades:
+            seen_grades.append(grade)
+    color_of = {
+        grade: grade_color(grade, index)
+        for index, grade in enumerate(seen_grades)
+    }
+
+    for pred in predictions:
         box = prediction_bbox(pred)
         if box is None:
             continue
@@ -342,19 +393,23 @@ def annotate_embryos(image: Image.Image, predictions: list) -> Image.Image:
         if x2 <= x1 or y2 <= y1:
             continue
 
-        grade = str(pred.get("class", "判定不能"))
+        grade = str(pred.get("class", "")).strip()
         color = color_of.get(grade, GRADE_COLORS[0])
         draw.rectangle([x1, y1, x2, y2], outline=color, width=line_width)
 
-        label = f"{index} {grade}"
-        text_w, text_h = text_pixel_size(draw, label, font)
-        pad = 4
-        label_top = y1 - text_h - pad * 2
-        if label_top < 0:
-            label_top = y1
-        label_box = [x1, label_top, min(width - 1, x1 + text_w + pad * 2), label_top + text_h + pad * 2]
-        draw.rectangle(label_box, fill=color)
-        draw.text((label_box[0] + pad, label_box[1] + pad), label, fill=(255, 255, 255), font=font)
+        text_w, text_h = text_pixel_size(draw, grade, font)
+        pad = 3
+        badge_w = text_w + pad * 2
+        badge_h = text_h + pad * 2
+        badge_left = x1 + max(0, (x2 - x1 - badge_w) // 2)
+        badge_top = y1 + max(0, (y2 - y1 - badge_h) // 2)
+        badge_left = max(0, min(width - badge_w, badge_left))
+        badge_top = max(0, min(height - badge_h, badge_top))
+        draw.rectangle(
+            [badge_left, badge_top, badge_left + badge_w, badge_top + badge_h],
+            fill=color,
+        )
+        draw.text((badge_left + pad, badge_top + pad), grade, fill=(255, 255, 255), font=font)
 
     return annotated
 
@@ -371,47 +426,23 @@ if uploaded_file is not None:
         st.error(f"画像の読み込みに失敗しました: {e}")
         st.stop()
 
-    st.image(image, caption="アップロードされた画像", use_container_width=True)
+    file_token = f"{uploaded_file.name}:{uploaded_file.size}"
+    if st.session_state.get("embryo_file_token") != file_token:
+        st.session_state["embryo_file_token"] = file_token
+        st.session_state.pop("embryo_annotated", None)
 
     if st.button("AIで解析・評価する", type="primary"):
         with st.spinner("AIが画像を解析中..."):
             try:
                 result = run_inference(image, API_KEY, MODEL_ID, WORKSPACE)
                 raw_predictions = extract_predictions(result)
-                predictions = sort_predictions_for_display(dedupe_predictions(raw_predictions))
-
-                st.success("解析が完了しました！")
+                predictions = rank_predictions(dedupe_predictions(raw_predictions))
 
                 if not predictions:
-                    if raw_predictions:
-                        st.info(
-                            "重なった検出結果を整理しましたが、有効な胚は見つかりませんでした。"
-                            "別の画像でお試しください。"
-                        )
-                    else:
-                        st.info("対象の胚は検出されませんでした。")
+                    st.session_state.pop("embryo_annotated", None)
+                    st.info("評価ランクが付いた胚は見つかりませんでした。")
                 else:
-                    st.subheader("AI診断結果")
-                    st.caption(
-                        f"評価した胚: **{len(predictions)} 個**。"
-                        "同じ評価名（例: EB-A）でも、位置が違えば別の胚です。"
-                        "画像の番号と下の一覧が対応しています。"
-                    )
-
-                    annotated = annotate_embryos(image, predictions)
-                    st.image(annotated, caption="番号と評価を枠で表示", use_container_width=True)
-
-                    for index, pred in enumerate(predictions, start=1):
-                        grade = pred.get("class", "判定不能")
-                        confidence = float(pred.get("confidence", 0) or 0) * 100
-                        st.markdown(
-                            f"**{index}. 【 {grade} 】**　確信度 {confidence:.1f}%"
-                        )
-
-                    with st.expander("詳細な解析データを見る（開発者・データ確認用）"):
-                        st.write(f"評価数: {len(predictions)} 個")
-                        st.write(f"AI生検出数: {len(raw_predictions)} 個")
-                        st.json(result)
+                    st.session_state["embryo_annotated"] = annotate_embryos(image, predictions)
 
             except requests.HTTPError as e:
                 status = e.response.status_code if e.response is not None else None
@@ -442,3 +473,9 @@ if uploaded_file is not None:
                 st.error(f"通信エラーが発生しました: {e}")
             except Exception as e:
                 st.error(f"解析中にエラーが発生しました: {e}")
+
+    annotated = st.session_state.get("embryo_annotated")
+    if annotated is not None:
+        st.image(annotated, use_container_width=True)
+    else:
+        st.image(image, caption="アップロードされた画像", use_container_width=True)
