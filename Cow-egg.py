@@ -3,7 +3,7 @@ import os
 
 import requests
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 ROBOFLOW_API_URL = "https://serverless.roboflow.com"
 
@@ -208,17 +208,10 @@ def is_same_embryo(
     a: tuple[float, float, float, float],
     b: tuple[float, float, float, float],
     *,
-    iou_threshold: float = 0.75,
+    iou_threshold: float = 0.92,
 ) -> bool:
-    """ほぼ同じ位置・同じ大きさの枠だけを同一胚とみなす。隣の胚は残す。"""
-    if bbox_iou(a, b) < iou_threshold:
-        return False
-    area_a = box_area(a)
-    area_b = box_area(b)
-    if area_a <= 0 or area_b <= 0:
-        return False
-    ratio = max(area_a, area_b) / min(area_a, area_b)
-    return ratio <= 1.5
+    """ほぼ完全に重なった枠だけを同一胚とみなす。見た目や評価名が似ていても別の胚は残す。"""
+    return bbox_iou(a, b) >= iou_threshold
 
 
 def drop_group_boxes(kept: list) -> list:
@@ -280,6 +273,92 @@ def dedupe_predictions(
     return [pred for _, _, pred in kept] + without_box
 
 
+GRADE_COLORS = [
+    (220, 38, 38),
+    (37, 99, 235),
+    (22, 163, 74),
+    (217, 119, 6),
+    (124, 58, 237),
+    (8, 145, 178),
+    (190, 24, 93),
+    (71, 85, 105),
+]
+
+
+def sort_predictions_for_display(predictions: list) -> list:
+    def sort_key(pred):
+        box = prediction_bbox(pred)
+        if box is None:
+            return (10**9, 10**9)
+        x1, y1, x2, y2 = box
+        return ((y1 + y2) / 2, (x1 + x2) / 2)
+
+    return sorted(predictions, key=sort_key)
+
+
+def load_label_font(image_width: int):
+    size = max(18, image_width // 45)
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/Library/Fonts/Arial.ttf",
+    ):
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    return ImageFont.load_default()
+
+
+def text_pixel_size(draw: ImageDraw.ImageDraw, text: str, font) -> tuple[int, int]:
+    if hasattr(draw, "textbbox"):
+        left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+        return right - left, bottom - top
+    width, height = draw.textsize(text, font=font)
+    return width, height
+
+
+def annotate_embryos(image: Image.Image, predictions: list) -> Image.Image:
+    annotated = image.copy()
+    draw = ImageDraw.Draw(annotated)
+    width, height = annotated.size
+    font = load_label_font(width)
+    line_width = max(3, width // 280)
+
+    grades = []
+    for pred in predictions:
+        grade = str(pred.get("class", "判定不能"))
+        if grade not in grades:
+            grades.append(grade)
+    color_of = {grade: GRADE_COLORS[i % len(GRADE_COLORS)] for i, grade in enumerate(grades)}
+
+    for index, pred in enumerate(predictions, start=1):
+        box = prediction_bbox(pred)
+        if box is None:
+            continue
+        x1, y1, x2, y2 = box
+        x1 = max(0, min(width - 1, int(round(x1))))
+        y1 = max(0, min(height - 1, int(round(y1))))
+        x2 = max(0, min(width - 1, int(round(x2))))
+        y2 = max(0, min(height - 1, int(round(y2))))
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        grade = str(pred.get("class", "判定不能"))
+        color = color_of.get(grade, GRADE_COLORS[0])
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=line_width)
+
+        label = f"{index} {grade}"
+        text_w, text_h = text_pixel_size(draw, label, font)
+        pad = 4
+        label_top = y1 - text_h - pad * 2
+        if label_top < 0:
+            label_top = y1
+        label_box = [x1, label_top, min(width - 1, x1 + text_w + pad * 2), label_top + text_h + pad * 2]
+        draw.rectangle(label_box, fill=color)
+        draw.text((label_box[0] + pad, label_box[1] + pad), label, fill=(255, 255, 255), font=font)
+
+    return annotated
+
+
 uploaded_file = st.file_uploader(
     "胚の画像を選択してください（JPG, JPEG, PNG）",
     type=["jpg", "jpeg", "png"],
@@ -299,7 +378,7 @@ if uploaded_file is not None:
             try:
                 result = run_inference(image, API_KEY, MODEL_ID, WORKSPACE)
                 raw_predictions = extract_predictions(result)
-                predictions = dedupe_predictions(raw_predictions)
+                predictions = sort_predictions_for_display(dedupe_predictions(raw_predictions))
 
                 st.success("解析が完了しました！")
 
@@ -313,23 +392,24 @@ if uploaded_file is not None:
                         st.info("対象の胚は検出されませんでした。")
                 else:
                     st.subheader("AI診断結果")
-                    st.caption(f"評価した胚: **{len(predictions)} 個**")
+                    st.caption(
+                        f"評価した胚: **{len(predictions)} 個**。"
+                        "同じ評価名（例: EB-A）でも、位置が違えば別の胚です。"
+                        "画像の番号と下の一覧が対応しています。"
+                    )
 
-                    if len(raw_predictions) > len(predictions):
-                        st.caption(
-                            f"（AIの生検出 {len(raw_predictions)} 件から、"
-                            f"同じ胚の重複 {len(raw_predictions) - len(predictions)} 件を除きました）"
-                        )
+                    annotated = annotate_embryos(image, predictions)
+                    st.image(annotated, caption="番号と評価を枠で表示", use_container_width=True)
 
-                    for pred in predictions:
+                    for index, pred in enumerate(predictions, start=1):
                         grade = pred.get("class", "判定不能")
                         confidence = float(pred.get("confidence", 0) or 0) * 100
-                        st.success(
-                            f"診断: この胚は **【 {grade} 】** です！（AI確信度: {confidence:.1f}%）"
+                        st.markdown(
+                            f"**{index}. 【 {grade} 】**　確信度 {confidence:.1f}%"
                         )
 
                     with st.expander("詳細な解析データを見る（開発者・データ確認用）"):
-                        st.write(f"評価数（重複除去後）: {len(predictions)} 個")
+                        st.write(f"評価数: {len(predictions)} 個")
                         st.write(f"AI生検出数: {len(raw_predictions)} 個")
                         st.json(result)
 
