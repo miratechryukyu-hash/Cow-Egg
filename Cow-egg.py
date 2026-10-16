@@ -296,6 +296,21 @@ def sort_predictions_for_display(predictions: list) -> list:
     return sorted(predictions, key=sort_key)
 
 
+def is_embryo_detection(class_name: str) -> bool:
+    text = str(class_name or "").strip().lower().replace("_", "-").replace(" ", "")
+    return "detect" in text or text in {"embryo", "胚"}
+
+
+def non_max_suppression(items: list, iou_threshold: float) -> list:
+    ordered = sorted(items, key=lambda item: item[0], reverse=True)
+    kept = []
+    for item in ordered:
+        if any(bbox_iou(item[1], other[1]) >= iou_threshold for other in kept):
+            continue
+        kept.append(item)
+    return drop_group_boxes(kept)
+
+
 def is_rank_label(class_name: str) -> bool:
     """EB-A や BL-A のような評価ランクだけを残す。検出用ラベルは除外する。"""
     text = str(class_name or "").strip()
@@ -307,20 +322,57 @@ def is_rank_label(class_name: str) -> bool:
     return "-" in text and len(text) <= 12
 
 
-def rank_predictions(predictions: list) -> list:
-    ranked = [
-        pred for pred in predictions
-        if isinstance(pred, dict) and is_rank_label(pred.get("class", ""))
-    ]
-    return sort_predictions_for_display(ranked)
-    def sort_key(pred):
+def grade_matches_embryo(embryo_box, grade_box) -> bool:
+    center_x = (grade_box[0] + grade_box[2]) / 2
+    center_y = (grade_box[1] + grade_box[3]) / 2
+    inside = (
+        embryo_box[0] <= center_x <= embryo_box[2]
+        and embryo_box[1] <= center_y <= embryo_box[3]
+    )
+    return inside or bbox_iou(embryo_box, grade_box) >= 0.25
+
+
+def assign_one_rank_per_embryo(predictions: list) -> list:
+    """
+    1つの胚に評価を1つだけ付ける。
+    位置は胚検出の枠、ランクはその胚に重なる評価のうち確信度が一番高いもの。
+    """
+    detections = []
+    grades = []
+    for pred in predictions or []:
+        if not isinstance(pred, dict):
+            continue
         box = prediction_bbox(pred)
         if box is None:
-            return (10**9, 10**9)
-        x1, y1, x2, y2 = box
-        return ((y1 + y2) / 2, (x1 + x2) / 2)
+            continue
+        confidence = float(pred.get("confidence", 0) or 0)
+        label = str(pred.get("class", "")).strip()
+        if is_rank_label(label):
+            if confidence < 0.35:
+                continue
+            grades.append((confidence, box, pred))
+        elif is_embryo_detection(label) and confidence >= 0.25:
+            detections.append((confidence, box, pred))
 
-    return sorted(predictions, key=sort_key)
+    if detections:
+        embryos = non_max_suppression(detections, 0.45)
+        ranked = []
+        for _, embryo_box, embryo_pred in embryos:
+            matched = [
+                grade for grade in grades
+                if grade_matches_embryo(embryo_box, grade[1])
+            ]
+            if not matched:
+                continue
+            best_confidence, _, best_pred = max(matched, key=lambda item: item[0])
+            merged = dict(embryo_pred)
+            merged["class"] = str(best_pred.get("class", "")).strip()
+            merged["confidence"] = best_confidence
+            ranked.append(merged)
+        return sort_predictions_for_display(ranked)
+
+    kept = non_max_suppression(grades, 0.5)
+    return sort_predictions_for_display([pred for _, _, pred in kept])
 
 
 def load_label_font(image_width: int):
@@ -436,7 +488,7 @@ if uploaded_file is not None:
             try:
                 result = run_inference(image, API_KEY, MODEL_ID, WORKSPACE)
                 raw_predictions = extract_predictions(result)
-                predictions = rank_predictions(dedupe_predictions(raw_predictions))
+                predictions = assign_one_rank_per_embryo(raw_predictions)
 
                 if not predictions:
                     st.session_state.pop("embryo_annotated", None)
