@@ -114,7 +114,7 @@ def run_inference(
     for url in build_inference_urls(model_id, workspace):
         response = requests.post(
             url,
-            params={"api_key": api_key, "confidence": 25}, 
+            params={"api_key": api_key, "confidence": 10}, 
             files={"file": ("image.jpg", img_bytes, "image/jpeg")},
             timeout=120,
         )
@@ -168,6 +168,22 @@ def prediction_bbox(pred) -> tuple[float, float, float, float] | None:
     return None
 
 
+def box_area(box: tuple[float, float, float, float]) -> float:
+    x1, y1, x2, y2 = box
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def intersection_area(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    inter_w = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    inter_h = max(0.0, min(ay2, by2) - max(ay1, by1))
+    return inter_w * inter_h
+
+
 def bbox_iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
@@ -188,17 +204,59 @@ def bbox_iou(a: tuple[float, float, float, float], b: tuple[float, float, float,
     return inter_area / union
 
 
+def is_same_embryo(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+    *,
+    iou_threshold: float = 0.75,
+) -> bool:
+    """ほぼ同じ位置・同じ大きさの枠だけを同一胚とみなす。隣の胚は残す。"""
+    if bbox_iou(a, b) < iou_threshold:
+        return False
+    area_a = box_area(a)
+    area_b = box_area(b)
+    if area_a <= 0 or area_b <= 0:
+        return False
+    ratio = max(area_a, area_b) / min(area_a, area_b)
+    return ratio <= 1.5
+
+
+def drop_group_boxes(kept: list) -> list:
+    """複数の胚をまとめて覆っている大きな枠だけを外す。"""
+    if len(kept) < 3:
+        return kept
+
+    drop_indexes: set[int] = set()
+    for i, (_, outer, _) in enumerate(kept):
+        outer_area = box_area(outer)
+        if outer_area <= 0:
+            continue
+        contained = 0
+        for j, (_, inner, _) in enumerate(kept):
+            if i == j:
+                continue
+            inner_area = box_area(inner)
+            if inner_area <= 0 or inner_area >= outer_area * 0.85:
+                continue
+            if intersection_area(outer, inner) / inner_area >= 0.8:
+                contained += 1
+        if contained >= 2:
+            drop_indexes.add(i)
+
+    return [item for i, item in enumerate(kept) if i not in drop_indexes]
+
+
 def dedupe_predictions(
     predictions: list,
     *,
-    iou_threshold: float = 0.45,
-    min_confidence: float = 0.15,
+    min_confidence: float = 0.1,
 ) -> list:
     """
-    同じ胚への重複検出を除く（NMS）。
-    評価件数が実際の胚の数より多くなる問題を抑える。
+    同じ胚への二重検出だけを除く。
+    隣り合う別の胚や、画像内の多数の胚は残す。
     """
     candidates = []
+    without_box = []
     for pred in predictions or []:
         if not isinstance(pred, dict):
             continue
@@ -207,17 +265,19 @@ def dedupe_predictions(
             continue
         box = prediction_bbox(pred)
         if box is None:
+            without_box.append(pred)
             continue
         candidates.append((confidence, box, pred))
 
     candidates.sort(key=lambda item: item[0], reverse=True)
     kept: list = []
     for confidence, box, pred in candidates:
-        if any(bbox_iou(box, kept_box) >= iou_threshold for _, kept_box, _ in kept):
+        if any(is_same_embryo(box, kept_box) for _, kept_box, _ in kept):
             continue
         kept.append((confidence, box, pred))
 
-    return [pred for _, _, pred in kept]
+    kept = drop_group_boxes(kept)
+    return [pred for _, _, pred in kept] + without_box
 
 
 uploaded_file = st.file_uploader(
