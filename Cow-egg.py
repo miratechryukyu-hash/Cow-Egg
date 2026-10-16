@@ -114,7 +114,7 @@ def run_inference(
     for url in build_inference_urls(model_id, workspace):
         response = requests.post(
             url,
-            params={"api_key": api_key, "confidence": 10}, 
+            params={"api_key": api_key, "confidence": 25}, 
             files={"file": ("image.jpg", img_bytes, "image/jpeg")},
             timeout=120,
         )
@@ -145,6 +145,81 @@ def extract_predictions(result) -> list:
     return []
 
 
+def prediction_bbox(pred) -> tuple[float, float, float, float] | None:
+    """Roboflow の bbox を (x_min, y_min, x_max, y_max) に統一"""
+    if not isinstance(pred, dict):
+        return None
+
+    if all(key in pred for key in ("x_min", "y_min", "x_max", "y_max")):
+        return (
+            float(pred["x_min"]),
+            float(pred["y_min"]),
+            float(pred["x_max"]),
+            float(pred["y_max"]),
+        )
+
+    if all(key in pred for key in ("x", "y", "width", "height")):
+        cx = float(pred["x"])
+        cy = float(pred["y"])
+        w = float(pred["width"])
+        h = float(pred["height"])
+        return (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+
+    return None
+
+
+def bbox_iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+    if inter_area <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter_area
+    if union <= 0:
+        return 0.0
+    return inter_area / union
+
+
+def dedupe_predictions(
+    predictions: list,
+    *,
+    iou_threshold: float = 0.45,
+    min_confidence: float = 0.15,
+) -> list:
+    """
+    同じ胚への重複検出を除く（NMS）。
+    評価件数が実際の胚の数より多くなる問題を抑える。
+    """
+    candidates = []
+    for pred in predictions or []:
+        if not isinstance(pred, dict):
+            continue
+        confidence = float(pred.get("confidence", 0) or 0)
+        if confidence < min_confidence:
+            continue
+        box = prediction_bbox(pred)
+        if box is None:
+            continue
+        candidates.append((confidence, box, pred))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    kept: list = []
+    for confidence, box, pred in candidates:
+        if any(bbox_iou(box, kept_box) >= iou_threshold for _, kept_box, _ in kept):
+            continue
+        kept.append((confidence, box, pred))
+
+    return [pred for _, _, pred in kept]
+
+
 uploaded_file = st.file_uploader(
     "胚の画像を選択してください（JPG, JPEG, PNG）",
     type=["jpg", "jpeg", "png"],
@@ -163,28 +238,39 @@ if uploaded_file is not None:
         with st.spinner("AIが画像を解析中..."):
             try:
                 result = run_inference(image, API_KEY, MODEL_ID, WORKSPACE)
-                predictions = extract_predictions(result)
+                raw_predictions = extract_predictions(result)
+                predictions = dedupe_predictions(raw_predictions)
 
                 st.success("解析が完了しました！")
 
                 if not predictions:
-                    st.info("対象の胚は検出されませんでした。")
+                    if raw_predictions:
+                        st.info(
+                            "重なった検出結果を整理しましたが、有効な胚は見つかりませんでした。"
+                            "別の画像でお試しください。"
+                        )
+                    else:
+                        st.info("対象の胚は検出されませんでした。")
                 else:
                     st.subheader("AI診断結果")
-                    
-                    # 検出された予測を一つずつわかりやすく表示する
-                    for i, pred in enumerate(predictions):
-                        # AIが判定したクラス名（例: EB-Aなど）を取得
+                    st.caption(f"評価した胚: **{len(predictions)} 個**")
+
+                    if len(raw_predictions) > len(predictions):
+                        st.caption(
+                            f"（AIの生検出 {len(raw_predictions)} 件から、"
+                            f"同じ胚の重複 {len(raw_predictions) - len(predictions)} 件を除きました）"
+                        )
+
+                    for pred in predictions:
                         grade = pred.get("class", "判定不能")
-                        # AIの自信度（確信度）をパーセンテージに変換
-                        confidence = pred.get("confidence", 0) * 100
-                        
-                        # 現場の人が一目でわかるようにデカデカと表示！
-                        st.success(f"診断: この胚は **【 {grade} 】** です！（AI確信度: {confidence:.1f}%）")
-                    
-                    # 画面がごちゃごちゃしないよう、元の生のデータは折りたたみメニューに隠す
+                        confidence = float(pred.get("confidence", 0) or 0) * 100
+                        st.success(
+                            f"診断: この胚は **【 {grade} 】** です！（AI確信度: {confidence:.1f}%）"
+                        )
+
                     with st.expander("詳細な解析データを見る（開発者・データ確認用）"):
-                        st.write(f"検出数: {len(predictions)} 個")
+                        st.write(f"評価数（重複除去後）: {len(predictions)} 個")
+                        st.write(f"AI生検出数: {len(raw_predictions)} 個")
                         st.json(result)
 
             except requests.HTTPError as e:
