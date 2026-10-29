@@ -33,6 +33,8 @@ NOTIFICATION_SETTINGS_KEYS = [
     "LINE通知",
     "現場_LINE_User_ID",
     "現場_LINE通知",
+    "現場_報告者名",
+    "獣医師_報告者名",
 ]
 
 DEFAULT_NOTIFICATION_SETTINGS = {
@@ -40,6 +42,8 @@ DEFAULT_NOTIFICATION_SETTINGS = {
     "LINE通知": "無効",
     "現場_LINE_User_ID": "",
     "現場_LINE通知": "無効",
+    "現場_報告者名": "",
+    "獣医師_報告者名": "",
 }
 
 DEPARTMENT_OPTIONS = [
@@ -333,11 +337,25 @@ def format_check_items(check_items, other_text=""):
     return ", ".join(labels)
 
 
+def report_reporter_name(report):
+    name = report_field(report, "報告担当者名")
+    if name:
+        return name
+    return report_field(report, "部署")
+
+
+def append_sender_footer(message, sender_name):
+    sender_name = str(sender_name or "").strip()
+    if not sender_name:
+        return message
+    return f"{message.rstrip()}\n\n送信者: {sender_name}"
+
+
 def render_optional_report_fields(row):
-    department = report_field(row, "部署")
+    reporter_name = report_reporter_name(row)
     check_items = report_field(row, "チェック項目")
-    if department:
-        st.write(f"**部署:** {department}")
+    if reporter_name:
+        st.write(f"**報告者:** {reporter_name}")
     if check_items:
         st.write(f"**チェック項目:** {check_items}")
 
@@ -391,12 +409,12 @@ def format_report_message(report, dashboard_url=""):
         f"判定: {report['トリアージ判定']}\n"
         f"個体: {report['個体識別番号']}\n"
         f"生年月日: {report['報告者名']}\n"
-        f"部署: {report_field(report, '部署') or '未入力'}\n"
         f"体温: {report['体温']} ℃\n"
         f"チェック項目: {report_field(report, 'チェック項目') or 'なし'}\n"
         f"症状: {report['主な症状'] or 'なし'}\n"
         f"報告日時: {report['日時']}"
     )
+    message = append_sender_footer(message, report_reporter_name(report))
     if dashboard_url:
         message += f"\n\n▼ 状況確認\n{dashboard_url}"
     return message
@@ -407,7 +425,6 @@ def build_line_messages(report):
     summary = (
         f"【{report['トリアージ判定']}】\n"
         f"個体: {report['個体識別番号']}\n"
-        f"部署: {report_field(report, '部署') or '未入力'}\n"
         f"体温: {report['体温']}℃\n"
         f"チェック: {report_field(report, 'チェック項目') or 'なし'}\n"
         f"症状: {report['主な症状'] or 'なし'}\n"
@@ -416,6 +433,7 @@ def build_line_messages(report):
         "指示・コメントを記入できます。\n"
         "（LINEトークへの返信でも連絡可能です）"
     )
+    summary = append_sender_footer(summary, report_reporter_name(report))
 
     messages = [{"type": "text", "text": summary}]
 
@@ -518,11 +536,14 @@ def notify_veterinarian(report):
         )
 
     if settings.get("現場_LINE通知") == "有効":
-        farm_message = (
-            f"【報告送信完了】\n"
-            f"個体: {report['個体識別番号']}\n"
-            f"判定: {report['トリアージ判定']}\n\n"
-            "獣医師からの指示はこのLINEに届きます。"
+        farm_message = append_sender_footer(
+            (
+                f"【報告送信完了】\n"
+                f"個体: {report['個体識別番号']}\n"
+                f"判定: {report['トリアージ判定']}\n\n"
+                "獣医師からの指示はこのLINEに届きます。"
+            ),
+            report_reporter_name(report),
         )
         farm_user_id = settings.get("現場_LINE_User_ID", "").strip()
         if not farm_user_id:
@@ -561,6 +582,8 @@ def notify_field_of_vet_response(report, comment):
         f"指示・コメント:\n{comment or '（コメントなし）'}\n\n"
         "返信はこのLINEにメッセージを送ってください。"
     )
+    sender_name = settings.get("獣医師_報告者名", "").strip() or "獣医師"
+    message = append_sender_footer(message, sender_name)
     ok, detail = send_line_text(farm_user_id, message)
     results.append(("現場", ok, detail))
     return results
@@ -859,6 +882,8 @@ with tab1:
 
     apply_management_seal_query_params()
     qr_defaults = get_qr_form_defaults()
+    name_settings = load_notification_settings()
+    default_reporter_name = name_settings.get("現場_報告者名", "")
 
     with st.expander("管理シールQRコード", expanded=bool(qr_defaults)):
         qr_text = st.text_input(
@@ -883,8 +908,7 @@ with tab1:
         if qr_defaults:
             st.caption(
                 "反映中: "
-                f"個体={qr_defaults.get('animal_id') or '未設定'} / "
-                f"部署={qr_defaults.get('department') or '未設定'}"
+                f"個体={qr_defaults.get('animal_id') or '未設定'}"
             )
 
     if shared_records_df is None:
@@ -907,7 +931,6 @@ with tab1:
         default_animal_id = qr_defaults["animal_id"]
 
     default_birth_date = qr_defaults.get("birth_date") or (datetime.now() - timedelta(days=365)).date()
-    default_department = normalize_department_name(qr_defaults.get("department", ""))
     default_check_items = normalize_check_items(qr_defaults.get("check_items", []))
 
     uploaded_file = st.file_uploader(
@@ -926,10 +949,10 @@ with tab1:
             value=default_birth_date,
             format="YYYY/MM/DD",
         )
-        department = st.selectbox(
-            "あなたの部署",
-            DEPARTMENT_OPTIONS,
-            index=department_index(default_department),
+        reporter_name = st.text_input(
+            "あなたの名前",
+            value=default_reporter_name,
+            placeholder="例: 山田太郎",
         )
         check_items = st.multiselect(
             "チェック項目（複数選択可）",
@@ -954,6 +977,8 @@ with tab1:
                 st.warning("誤送信を防ぐため、「すべての入力が完了しました」にチェックを入れてから送信ボタンを押してください。")
             elif not animal_id:
                 st.error("個体識別番号は必須です。")
+            elif not reporter_name.strip():
+                st.error("名前を入力してください。")
             else:
                 with st.spinner('データを送信しています...'):
                     triage = "低・定例報告"
@@ -984,7 +1009,7 @@ with tab1:
                         "日時": now_jst,
                         "報告者名": birth_date_str,
                         "個体識別番号": animal_id,
-                        "部署": department,
+                        "報告担当者名": reporter_name.strip(),
                         "体温": temperature,
                         "チェック項目": check_items_text,
                         "主な症状": ", ".join(symptoms),
@@ -1001,6 +1026,13 @@ with tab1:
                         conn.update(worksheet="問診記録", data=updated_data)
                         clear_sheet_cache(records=True, notifications=False)
                         st.session_state.pop(QR_DEFAULTS_SESSION_KEY, None)
+                        try:
+                            updated_name_settings = load_notification_settings()
+                            updated_name_settings["現場_報告者名"] = reporter_name.strip()
+                            save_notification_settings(updated_name_settings)
+                            clear_sheet_cache(notifications=True, records=False)
+                        except Exception:
+                            st.caption("名前の保存に失敗しました。次回は手入力が必要です。")
                         st.success(f"スプレッドシートへの送信が完了しました。 判定結果: {triage}")
 
                         notification_results = notify_veterinarian(new_row)
@@ -1083,13 +1115,21 @@ with tab3:
                     st.subheader("報告一覧")
 
                     summary_columns = [
-                        "日時", "部署", "体温", "チェック項目", "主な症状",
+                        "日時", "報告担当者名", "体温", "チェック項目", "主な症状",
                         "トリアージ判定", "確認ステータス", "獣医師コメント",
                     ]
+                    summary_df = animal_records.copy()
+                    if "報告担当者名" not in summary_df.columns:
+                        summary_df["報告担当者名"] = ""
+                    if "部署" in summary_df.columns:
+                        empty_name = summary_df["報告担当者名"].astype(str).str.strip() == ""
+                        summary_df.loc[empty_name, "報告担当者名"] = summary_df.loc[
+                            empty_name, "部署"
+                        ].astype(str)
                     available_columns = [
-                        column for column in summary_columns if column in animal_records.columns
+                        column for column in summary_columns if column in summary_df.columns
                     ]
-                    summary_df = animal_records[available_columns].copy()
+                    summary_df = summary_df[available_columns].copy()
                     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
                     record_options = animal_records.index.tolist()
@@ -1144,6 +1184,11 @@ with tab4:
             "獣医師への報告通知を有効にする",
             value=current_settings.get("LINE通知") == "有効",
         )
+        vet_display_name = st.text_input(
+            "獣医師の名前（LINEの末尾「送信者」に表示）",
+            value=current_settings.get("獣医師_報告者名", ""),
+            placeholder="例: 田中獣医師",
+        )
 
         st.divider()
         st.subheader("現場担当者（返信を受け取る人）")
@@ -1156,6 +1201,11 @@ with tab4:
             "現場への受付確認・返信通知を有効にする",
             value=current_settings.get("現場_LINE通知") == "有効",
         )
+        farm_display_name = st.text_input(
+            "現場の名前（LINEトーク転送時の「送信者」・任意）",
+            value=current_settings.get("現場_報告者名", ""),
+            placeholder="報告フォームで保存した名前と同じにすると便利です",
+        )
 
         save_settings = st.form_submit_button("設定を保存")
 
@@ -1165,6 +1215,8 @@ with tab4:
             "LINE通知": "有効" if line_enabled else "無効",
             "現場_LINE_User_ID": farm_line_user_id.strip(),
             "現場_LINE通知": "有効" if farm_line_enabled else "無効",
+            "現場_報告者名": farm_display_name.strip(),
+            "獣医師_報告者名": vet_display_name.strip(),
         }
         try:
             save_notification_settings(new_settings)
@@ -1203,6 +1255,7 @@ with tab4:
             "トリアージ判定": "中・要観察",
             "個体識別番号": "テスト個体",
             "報告者名": "2020-01-01",
+            "報告担当者名": current_settings.get("現場_報告者名", "") or "テスト担当",
             "体温": 39.0,
             "主な症状": "テスト通知",
             "日時": datetime.now(timezone(timedelta(hours=+9))).strftime("%Y-%m-%d %H:%M"),

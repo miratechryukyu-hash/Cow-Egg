@@ -38,12 +38,11 @@ function handleEvent(event) {
   }
 
   if (targetId) {
-    pushMessage(
-      targetId,
-      `【${senderLabel}からの連絡】\n${text}\n\n※返信はこのLINEにメッセージを送ってください。`
-    );
+    const senderName = resolveSenderName(fromUserId, settings, senderLabel);
+    const body = `${text}\n\n送信者: ${senderName}\n\n※返信はこのLINEにメッセージを送ってください。`;
+    pushMessage(targetId, body);
     replyMessage(event.replyToken, "メッセージを相手に転送しました。");
-    logMessage(senderLabel, text);
+    logMessage(senderName, text);
     return;
   }
 
@@ -66,6 +65,18 @@ function loadSettings() {
   });
 
   return settings;
+}
+
+function resolveSenderName(fromUserId, settings, fallbackLabel) {
+  const vetId = settings.LINE_User_ID || "";
+  const farmId = settings["現場_LINE_User_ID"] || "";
+  if (fromUserId === vetId) {
+    return settings["獣医師_報告者名"] || fallbackLabel || "獣医師";
+  }
+  if (fromUserId === farmId) {
+    return settings["現場_報告者名"] || fallbackLabel || "現場";
+  }
+  return fallbackLabel || "不明";
 }
 
 function logMessage(senderLabel, text) {
